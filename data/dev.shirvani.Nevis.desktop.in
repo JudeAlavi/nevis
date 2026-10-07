@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Nevis
+GenericName=Text Editor
+Comment=Fast text and Markdown editor
+Exec=@BINDIR@/nevis %F
+Icon=accessories-text-editor
+Terminal=false
+Categories=Utility;TextEditor;GTK;
+MimeType=text/plain;text/markdown;text/x-markdown;
+Keywords=text;editor;markdown;notepad;notes;
+StartupNotify=true

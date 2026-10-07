@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Ayu Mirage for GtkSourceView 5, matching ~/.config/kitty/current-theme.conf -->
+<style-scheme id="nevis-ayu-mirage" name="Ayu Mirage (nevis)" version="1.0">
+  <author>nevis</author>
+  <description>Ayu Mirage</description>
+  <metadata>
+    <property name="variant">dark</property>
+  </metadata>
+
+  <color name="bg"          value="#1F2430"/>
+  <color name="bg_line"     value="#1A1F29"/>
+  <color name="fg"          value="#CCCAC2"/>
+  <color name="selection"   value="#34455A"/>
+  <color name="selection_unfocused" value="#2B3647"/>
+  <color name="gutter"      value="#5C6773"/>
+  <color name="comment"     value="#707A8C"/>
+  <color name="accent"      value="#FFCC66"/>
+  <color name="markup"      value="#F28779"/>
+  <color name="red"         value="#FF6666"/>
+  <color name="keyword"     value="#FFAD66"/>
+  <color name="func"        value="#FFD173"/>
+  <color name="string"      value="#BAE67E"/>
+  <color name="entity"      value="#73D0FF"/>
+  <color name="tag"         value="#5CCFE6"/>
+  <color name="regexp"      value="#95E6CB"/>
+  <color name="constant"    value="#DFBFFF"/>
+  <color name="operator"    value="#F29E74"/>
+  <color name="find"        value="#695380"/>
+  <color name="whitespace"  value="#3D4A5C"/>
+
+  <!-- editor chrome -->
+  <style name="text"                 foreground="fg" background="bg"/>
+  <style name="selection"            background="selection"/>
+  <style name="selection-unfocused"  background="selection_unfocused"/>
+  <style name="cursor"               foreground="accent"/>
+  <style name="current-line"         background="bg_line"/>
+  <style name="line-numbers"         foreground="gutter" background="bg"/>
+  <style name="current-line-number"  foreground="fg" background="bg_line"/>
+  <style name="bracket-match"        foreground="accent" bold="true"/>
+  <style name="search-match"         background="find"/>
+  <style name="draw-spaces"          foreground="whitespace"/>
+  <style name="background-pattern"   background="bg_line"/>
+
+  <!-- code -->
+  <style name="def:comment"              foreground="comment" italic="true"/>
+  <style name="def:doc-comment-element"  foreground="comment" bold="true"/>
+  <style name="def:shebang"              foreground="comment" bold="true"/>
+  <style name="def:constant"             foreground="constant"/>
+  <style name="def:special-constant"     foreground="constant"/>
+  <style name="def:number"               foreground="constant"/>
+  <style name="def:boolean"              foreground="constant"/>
+  <style name="def:character"            foreground="string"/>
+  <style name="def:string"               foreground="string"/>
+  <style name="def:special-char"         foreground="regexp"/>
+  <style name="def:identifier"           foreground="fg"/>
+  <style name="def:function"             foreground="func"/>
+  <style name="def:builtin"              foreground="tag"/>
+  <style name="def:statement"            foreground="keyword"/>
+  <style name="def:keyword"              foreground="keyword"/>
+  <style name="def:operator"             foreground="operator"/>
+  <style name="def:type"                 foreground="entity"/>
+  <style name="def:preprocessor"         foreground="keyword"/>
+  <style name="def:error"                underline="error"/>
+  <style name="def:warning"              underline="error"/>
+  <style name="def:note"                 foreground="bg" background="accent" bold="true"/>
+  <style name="def:net-address"          foreground="entity" underline="single"/>
+  <style name="def:underlined"           underline="single"/>
+  <style name="def:insertion"            foreground="string"/>
+  <style name="def:deletion"             foreground="markup" strikethrough="true"/>
+
+  <!-- markdown (markdown.lang maps onto these) -->
+  <style name="def:heading"              foreground="accent" bold="true" scale="1.25"/>
+  <style name="def:emphasis"             italic="true"/>
+  <style name="def:strong-emphasis"      bold="true"/>
+  <style name="def:inline-code"          foreground="regexp"/>
+  <style name="def:preformatted-section" foreground="regexp"/>
+  <style name="def:list-marker"          foreground="keyword" bold="true"/>
+  <style name="def:thematic-break"       foreground="comment"/>
+  <style name="def:link-text"            foreground="entity"/>
+  <style name="def:link-symbol"          foreground="comment"/>
+  <style name="def:link-destination"     foreground="comment" italic="true"/>
+
+  <!-- diff -->
+  <style name="diff:added-line"          foreground="string"/>
+  <style name="diff:removed-line"        foreground="markup"/>
+  <style name="diff:changed-line"        foreground="keyword"/>
+  <style name="diff:location"            foreground="constant"/>
+</style-scheme>

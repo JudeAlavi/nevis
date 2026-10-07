@@ -1,0 +1,13 @@
+[Unit]
+Description=nevis text editor, kept running so files open instantly
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=dev.shirvani.Nevis
+ExecStart=@BINDIR@/nevis --gapplication-service
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
