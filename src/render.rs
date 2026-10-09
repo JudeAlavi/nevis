@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use gtk::{gdk, gio, glib, pango, prelude::*};
-use pulldown_cmark::{Alignment, BlockQuoteKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use sourceview::prelude::*;
 
-use crate::theme::palette;
+use crate::{flowchart, links, math};
+use crate::theme::{self, fonts};
 
 /// What a click on the rendered text does.
 #[derive(Clone)]
@@ -16,9 +17,50 @@ pub enum Target {
     Link(String),
     /// A task checkbox: the byte range of its `[ ]` / `[x]` in the Markdown source.
     Task(Range<usize>),
+    /// A note, by its file (the notes linking here, under the rendered note).
+    File(gio::File),
 }
 
-/// Side margins of the read view. Tag margins replace the view's, so indents add to this.
+/// Markdown features nevis understands, shared by the read view and the source styling.
+pub const OPTIONS: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_FOOTNOTES)
+    .union(Options::ENABLE_STRIKETHROUGH)
+    .union(Options::ENABLE_TASKLISTS)
+    .union(Options::ENABLE_GFM)
+    .union(Options::ENABLE_WIKILINKS)
+    .union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS)
+    .union(Options::ENABLE_MATH);
+
+/// The Markdown's events, with where each is in `source`. Front matter counts only at the very
+/// top of a note, as in Obsidian: pulldown-cmark takes any `---` line after a blank one, with
+/// text right under it, for the start of some, and the rest of the note goes with it.
+pub fn events(source: &str) -> impl Iterator<Item = (Event<'_>, Range<usize>)> {
+    let top = front_matter(source);
+    let rest = OPTIONS.difference(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    Parser::new_ext(&source[..top], OPTIONS).into_offset_iter().chain(
+        Parser::new_ext(&source[top..], rest)
+            .into_offset_iter()
+            .map(move |(event, range)| (event, range.start + top..range.end + top)),
+    )
+}
+
+/// How long the note's front matter is, in bytes: from a first line of `---` through the `---`
+/// or `...` line that closes it; 0 when the note has none.
+fn front_matter(source: &str) -> usize {
+    let mut lines = source.split_inclusive('\n');
+    let Some(first) = lines.next().filter(|line| line.trim_end() == "---") else { return 0 };
+    let mut length = first.len();
+    for line in lines {
+        length += line.len();
+        if matches!(line.trim_end(), "---" | "...") {
+            return length;
+        }
+    }
+    0
+}
+
+/// Side margins of the read view at full width (centred text has wider ones). Tag margins
+/// replace the view's, so indents add to the margin.
 pub const MARGIN: i32 = 28;
 
 pub struct Rendered {
@@ -27,22 +69,33 @@ pub struct Rendered {
     pub targets: Vec<(gtk::TextTag, Target)>,
     /// Images and tables, to attach once `buffer` is on a view.
     pub children: Vec<(gtk::TextChildAnchor, gtk::Widget)>,
+    /// Each heading's text and where it starts, for `#heading` links.
+    pub headings: Vec<(String, gtk::TextMark)>,
+    /// Fenced code blocks that name a language, to colour with `highlight_code`.
+    pub code: Vec<CodeBlock>,
 }
 
-/// Renders `source` into a new buffer. `folder` resolves relative image paths.
-pub fn render(source: &str, folder: Option<&gio::File>, scheme: Option<&sourceview::StyleScheme>) -> Rendered {
+pub struct CodeBlock {
+    pub start: gtk::TextMark,
+    pub end: gtk::TextMark,
+    pub language: String,
+}
+
+/// Renders `source` into a new buffer. `folder` resolves relative image paths; `text` lays a
+/// text out in the view's font (list bullets hang by their width; diagrams use it too);
+/// `margin` is the view's side margin, which indented blocks add to.
+pub fn render(
+    source: &str,
+    folder: Option<&gio::File>,
+    scheme: Option<&sourceview::StyleScheme>,
+    text: &dyn Fn(&str) -> pango::Layout,
+    margin: i32,
+) -> Rendered {
     let buffer = sourceview::Buffer::new(None);
     buffer.set_style_scheme(scheme);
     buffer.set_highlight_syntax(false);
-    let mut r = Renderer::new(folder, buffer);
-    let options = Options::ENABLE_TABLES
-        | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_GFM
-        | Options::ENABLE_WIKILINKS
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+    let mut r = Renderer::new(folder, buffer, text, margin);
+    for (event, range) in events(source) {
         r.event(event, range);
     }
     r.finish()
@@ -64,10 +117,14 @@ struct Styles {
     dim: gtk::TextTag,
     rule: gtk::TextTag,
     gap: gtk::TextTag,
+    /// A diagram's line: centred.
+    figure: gtk::TextTag,
+    math: gtk::TextTag,
+    display_math: gtk::TextTag,
 }
 
 impl Styles {
-    fn new(table: &gtk::TextTagTable) -> Self {
+    fn new(table: &gtk::TextTagTable, margin: i32) -> Self {
         let add = |tag: gtk::TextTag| {
             table.add(&tag);
             tag
@@ -76,7 +133,7 @@ impl Styles {
             add(gtk::TextTag::builder()
                 .weight(700)
                 .scale(scale)
-                .foreground(palette::HEADING)
+                .foreground(theme::colors().heading.to_hex())
                 .pixels_above_lines(above)
                 .pixels_below_lines(6)
                 .build())
@@ -87,29 +144,38 @@ impl Styles {
             strong: add(gtk::TextTag::builder().weight(700).build()),
             emphasis: add(gtk::TextTag::builder().style(pango::Style::Italic).build()),
             strike: add(gtk::TextTag::builder().strikethrough(true).build()),
-            code: add(gtk::TextTag::builder().family(palette::MONO).foreground(palette::CODE).background(palette::CODE_BG).build()),
+            code: add(gtk::TextTag::builder().family(fonts::MONO).foreground(theme::colors().code.to_hex()).background(theme::colors().code_background.to_hex()).build()),
             code_block: add(gtk::TextTag::builder()
-                .family(palette::MONO)
-                .foreground(palette::CODE)
-                .paragraph_background(palette::CODE_BG)
+                .family(fonts::MONO)
+                .foreground(theme::colors().code.to_hex())
+                .paragraph_background(theme::colors().code_background.to_hex())
                 .direction(gtk::TextDirection::Ltr)
-                .left_margin(MARGIN + 12)
-                .right_margin(MARGIN + 12)
+                .left_margin(margin + 12)
+                .right_margin(margin + 12)
                 .build()),
             code_top: add(gtk::TextTag::builder().pixels_above_lines(8).build()),
             code_bottom: add(gtk::TextTag::builder().pixels_below_lines(14).build()),
             quote: add(gtk::TextTag::builder()
-                .paragraph_background(palette::QUOTE_BG)
-                .foreground(palette::DIM_FG)
-                .left_margin(MARGIN + 14)
-                .right_margin(MARGIN + 14)
+                .paragraph_background(theme::colors().quote_background.to_hex())
+                .foreground(theme::colors().quote.to_hex())
+                .left_margin(margin + 14)
+                .right_margin(margin + 14)
                 .pixels_above_lines(2)
                 .pixels_below_lines(2)
                 .build()),
-            callout: add(gtk::TextTag::builder().weight(700).foreground(palette::ACCENT).build()),
-            done: add(gtk::TextTag::builder().strikethrough(true).foreground(palette::DIM).build()),
-            dim: add(gtk::TextTag::builder().foreground(palette::DIM).build()),
-            rule: add(gtk::TextTag::builder().size_points(1.0).paragraph_background(palette::RULE).build()),
+            callout: add(gtk::TextTag::builder().weight(700).foreground(theme::colors().accent.to_hex()).build()),
+            done: add(gtk::TextTag::builder().strikethrough(true).foreground(theme::colors().dim.to_hex()).build()),
+            dim: add(gtk::TextTag::builder().foreground(theme::colors().dim.to_hex()).build()),
+            rule: add(gtk::TextTag::builder().size_points(1.0).paragraph_background(theme::colors().rule.to_hex()).build()),
+            figure: add(gtk::TextTag::builder().justification(gtk::Justification::Center).pixels_above_lines(4).build()),
+            math: add(gtk::TextTag::builder().family(fonts::MATH).build()),
+            display_math: add(gtk::TextTag::builder()
+                .justification(gtk::Justification::Center)
+                .direction(gtk::TextDirection::Ltr)
+                .scale(1.15)
+                .pixels_above_lines(4)
+                .pixels_below_lines(12)
+                .build()),
             gap: add(gtk::TextTag::builder().size_points(5.0).build()),
         }
     }
@@ -133,8 +199,11 @@ struct Cell {
     plain: String,
 }
 
-struct Renderer {
+struct Renderer<'m> {
     folder: Option<gio::File>,
+    text: &'m dyn Fn(&str) -> pango::Layout,
+    /// The view's side margin, which indents add to.
+    margin: i32,
     buffer: sourceview::Buffer,
     styles: Styles,
     /// Tags for everything inserted now: block-level ones, then inline ones.
@@ -144,9 +213,16 @@ struct Renderer {
     quote_depth: usize,
     /// A list item started and its bullet is not written yet.
     pending_bullet: bool,
-    /// Per-depth list indents, left-to-right and right-to-left variants.
-    indents: HashMap<(usize, bool), gtk::TextTag>,
+    /// Where each open list item's indent tag sits in `block`, to swap in its hanging indent.
+    items: Vec<usize>,
+    /// List indents by (depth, hanging width, right-to-left).
+    indents: HashMap<(usize, i32, bool), gtk::TextTag>,
     code_start: Option<i32>,
+    code_language: Option<String>,
+    code: Vec<CodeBlock>,
+    /// The heading being written: where it starts and its text so far.
+    heading: Option<(i32, String)>,
+    headings: Vec<(String, gtk::TextMark)>,
     /// Image URL and alt text, while inside `![…](…)`.
     image: Option<(String, String)>,
     table: Option<Table>,
@@ -154,13 +230,19 @@ struct Renderer {
     markup_close: Vec<&'static str>,
     targets: Vec<(gtk::TextTag, Target)>,
     children: Vec<(gtk::TextChildAnchor, gtk::Widget)>,
+    /// Raised or lowered, smaller text for formulas' scripts, by rise and depth.
+    scripts: HashMap<(i8, u8), gtk::TextTag>,
+    /// The source of the Mermaid block being read, kept aside to draw at its end.
+    mermaid: Option<String>,
 }
 
-impl Renderer {
-    fn new(folder: Option<&gio::File>, buffer: sourceview::Buffer) -> Self {
-        let styles = Styles::new(&buffer.tag_table());
+impl<'m> Renderer<'m> {
+    fn new(folder: Option<&gio::File>, buffer: sourceview::Buffer, text: &'m dyn Fn(&str) -> pango::Layout, margin: i32) -> Self {
+        let styles = Styles::new(&buffer.tag_table(), margin);
         Self {
             folder: folder.cloned(),
+            text,
+            margin,
             buffer,
             styles,
             block: Vec::new(),
@@ -168,14 +250,26 @@ impl Renderer {
             lists: Vec::new(),
             quote_depth: 0,
             pending_bullet: false,
+            items: Vec::new(),
             indents: HashMap::new(),
             code_start: None,
+            code_language: None,
+            code: Vec::new(),
+            heading: None,
+            headings: Vec::new(),
             image: None,
             table: None,
             markup_close: Vec::new(),
             targets: Vec::new(),
             children: Vec::new(),
+            scripts: HashMap::new(),
+            mermaid: None,
         }
+    }
+
+    /// `text`'s width in pixels in the view's font.
+    fn measure(&self, text: &str) -> i32 {
+        (self.text)(text).pixel_size().0
     }
 
     fn event(&mut self, event: Event, range: Range<usize>) {
@@ -185,9 +279,8 @@ impl Renderer {
             Event::Text(text) => self.text(&text),
             // U+2068…U+2069 isolate the span: `~/notes/a.md` inside Persian stays in order.
             Event::Code(text) => self.styled(&format!("\u{2068}{text}\u{2069}"), self.styles.code.clone(), "<tt>", "</tt>"),
-            Event::InlineMath(text) | Event::DisplayMath(text) => {
-                self.styled(&text, self.styles.code.clone(), "<tt>", "</tt>")
-            }
+            Event::InlineMath(latex) => self.math(&latex, false),
+            Event::DisplayMath(latex) => self.math(&latex, true),
             Event::Html(html) | Event::InlineHtml(html) => {
                 let tag = html.trim().to_ascii_lowercase();
                 if matches!(tag.as_str(), "<br>" | "<br/>" | "<br />") {
@@ -220,6 +313,7 @@ impl Renderer {
             }
             Tag::Heading { level, .. } => {
                 self.end_line();
+                self.heading = Some((self.buffer.end_iter().offset(), String::new()));
                 self.block.push(self.styles.headings[heading_index(level)].clone());
             }
             Tag::BlockQuote(kind) => {
@@ -240,6 +334,14 @@ impl Renderer {
             }
             Tag::CodeBlock(_) | Tag::MetadataBlock(_) => {
                 self.end_line();
+                if let Tag::CodeBlock(CodeBlockKind::Fenced(info)) = &tag {
+                    self.code_language = info.split_whitespace().next().map(str::to_owned);
+                }
+                // A diagram is drawn once all of its source is in.
+                if self.code_language.as_deref() == Some("mermaid") {
+                    self.mermaid = Some(String::new());
+                    return;
+                }
                 self.code_start = Some(self.buffer.end_iter().offset());
                 self.block.push(self.styles.code_block.clone());
             }
@@ -252,7 +354,8 @@ impl Renderer {
             }
             Tag::Item => {
                 self.end_line();
-                let indent = self.indent(self.lists.len(), false);
+                let indent = self.indent(self.lists.len(), 0, false);
+                self.items.push(self.block.len());
                 self.block.push(indent);
                 self.pending_bullet = true;
             }
@@ -283,7 +386,7 @@ impl Renderer {
                     _ => dest_url.to_string(),
                 };
                 let tag = gtk::TextTag::builder()
-                    .foreground(palette::LINK)
+                    .foreground(theme::colors().link.to_hex())
                     .underline(pango::Underline::Single)
                     .build();
                 self.buffer.tag_table().add(&tag);
@@ -309,6 +412,10 @@ impl Renderer {
             TagEnd::Heading(_) => {
                 self.end_line();
                 self.block.pop();
+                if let Some((start, text)) = self.heading.take() {
+                    let mark = self.buffer.create_mark(None, &self.buffer.iter_at_offset(start), true);
+                    self.headings.push((text, mark));
+                }
             }
             TagEnd::BlockQuote(_) => {
                 self.end_line();
@@ -319,9 +426,24 @@ impl Renderer {
                 }
             }
             TagEnd::CodeBlock | TagEnd::MetadataBlock(_) => {
+                // A flowchart is drawn; other diagrams are shown as their code.
+                if let Some(source) = self.mermaid.take() {
+                    if let Some(chart) = flowchart::parse(&source) {
+                        self.code_language = None;
+                        return self.figure(flowchart::picture(&chart, self.text).upcast());
+                    }
+                    self.code_start = Some(self.buffer.end_iter().offset());
+                    self.block.push(self.styles.code_block.clone());
+                    self.text(&source);
+                }
                 self.end_line();
                 self.block.pop();
                 if let Some(start) = self.code_start.take() {
+                    if let Some(language) = self.code_language.take() {
+                        let start = self.buffer.create_mark(None, &self.buffer.iter_at_offset(start), true);
+                        let end = self.buffer.create_mark(None, &self.buffer.end_iter(), true);
+                        self.code.push(CodeBlock { start, end, language });
+                    }
                     self.space_code_block(start);
                 }
                 if self.quote_depth == 0 {
@@ -338,6 +460,7 @@ impl Renderer {
                 }
                 self.end_line();
                 self.block.pop();
+                self.items.pop();
                 // A checked task's strike-through ends with its item.
                 if self.inline.last() == Some(&self.styles.done) {
                     self.inline.pop();
@@ -370,6 +493,10 @@ impl Renderer {
 
     /// Plain text in the current styles.
     fn text(&mut self, text: &str) {
+        if let Some(source) = &mut self.mermaid {
+            source.push_str(text);
+            return;
+        }
         if let Some((_, alt)) = &mut self.image {
             alt.push_str(text);
             return;
@@ -381,6 +508,9 @@ impl Renderer {
         }
         if self.pending_bullet {
             self.bullet();
+        }
+        if let Some((_, heading)) = &mut self.heading {
+            heading.push_str(text);
         }
         let tags: Vec<&gtk::TextTag> = self.block.iter().chain(self.inline.iter()).collect();
         let mut end = self.buffer.end_iter();
@@ -432,6 +562,70 @@ impl Renderer {
         }
     }
 
+    /// A formula, its scripts raised (or lowered) and smaller; a display formula on centred
+    /// lines of its own.
+    fn math(&mut self, latex: &str, display: bool) {
+        let runs = math::runs(latex);
+        if let Some(cell) = self.cell() {
+            cell.markup.push_str(&format!("<span font_family=\"{}\">", fonts::MATH));
+            for run in &runs {
+                let script = match run.rise {
+                    rise if rise > 0 => "sup",
+                    rise if rise < 0 => "sub",
+                    _ => "small",
+                };
+                let depth = usize::from(run.depth);
+                let text = glib::markup_escape_text(&run.text.replace('\n', "; "));
+                cell.markup.push_str(&format!("{}{text}{}", format!("<{script}>").repeat(depth), format!("</{script}>").repeat(depth)));
+                cell.plain.push_str(&run.text);
+            }
+            cell.markup.push_str("</span>");
+            return;
+        }
+        if display {
+            self.end_line();
+            self.block.push(self.styles.display_math.clone());
+        } else {
+            // Isolated like code, so a formula inside Persian keeps its order.
+            self.text("\u{2068}");
+        }
+        self.inline.push(self.styles.math.clone());
+        for run in &runs {
+            let script = self.script(run.rise, run.depth);
+            self.inline.extend(script.clone());
+            self.text(&if display { run.text.clone() } else { run.text.replace('\n', "; ") });
+            if script.is_some() {
+                self.inline.pop();
+            }
+        }
+        self.inline.pop();
+        if display {
+            self.end_line();
+            self.block.pop();
+        } else {
+            self.text("\u{2069}");
+        }
+    }
+
+    /// The tag for a formula's script `rise` fifths of an em up (down when negative) and
+    /// `depth` scripts deep; none on the baseline.
+    fn script(&mut self, rise: i8, depth: u8) -> Option<gtk::TextTag> {
+        if rise == 0 && depth == 0 {
+            return None;
+        }
+        let em = self.measure("M").max(8);
+        let table = self.buffer.tag_table();
+        let tag = self.scripts.entry((rise, depth)).or_insert_with(|| {
+            let tag = gtk::TextTag::builder()
+                .rise(i32::from(rise) * em * pango::SCALE / 5)
+                .scale(if depth <= 1 { 0.72 } else { 0.58 })
+                .build();
+            table.add(&tag);
+            tag
+        });
+        Some(tag.clone())
+    }
+
     /// Writes the pending list bullet ("•", "◦", "▪" or "3.").
     fn bullet(&mut self) {
         self.pending_bullet = false;
@@ -447,14 +641,24 @@ impl Renderer {
                 _ => "▪ ".to_owned(),
             },
         };
+        self.hang(&marker);
         self.inline.push(self.styles.dim.clone());
         self.text(&marker);
         self.inline.pop();
     }
 
+    /// Indents the open list item so its wrapped lines start under its text, not its marker.
+    fn hang(&mut self, marker: &str) {
+        let Some(&slot) = self.items.last() else { return };
+        let indent = self.indent(self.lists.len(), self.measure(marker), false);
+        self.block[slot] = indent;
+    }
+
     fn task(&mut self, done: bool, range: Range<usize>) {
         self.pending_bullet = false;
-        let tag = gtk::TextTag::builder().foreground(if done { palette::ACCENT } else { palette::DIM }).build();
+        self.hang(if done { "☑ " } else { "☐ " });
+        let colors = theme::colors();
+        let tag = gtk::TextTag::builder().foreground((if done { colors.accent } else { colors.dim }).to_hex()).build();
         self.buffer.tag_table().add(&tag);
         self.targets.push((tag.clone(), Target::Task(range)));
         self.styled(if done { "☑ " } else { "☐ " }, tag, "", "");
@@ -468,13 +672,15 @@ impl Renderer {
             return self.text(&format!("[image: {alt}]"));
         }
         let local = !url.contains("://");
+        // "Pasted%20image.png" is the file "Pasted image.png", as in links.
+        let path = links::decode(url);
         let texture = local
-            .then(|| self.folder.as_ref().map(|f| f.resolve_relative_path(url)).unwrap_or_else(|| gio::File::for_path(url)))
+            .then(|| self.folder.as_ref().map(|f| f.resolve_relative_path(&path)).unwrap_or_else(|| gio::File::for_path(&path)))
             .and_then(|file| gdk::Texture::from_file(&file).ok());
         let Some(texture) = texture else {
             // Remote or unreadable: show the alt text as a link instead.
             let label = if alt.is_empty() { url } else { alt };
-            let tag = gtk::TextTag::builder().foreground(palette::LINK).underline(pango::Underline::Single).build();
+            let tag = gtk::TextTag::builder().foreground(theme::colors().link.to_hex()).underline(pango::Underline::Single).build();
             self.buffer.tag_table().add(&tag);
             self.targets.push((tag.clone(), Target::Link(url.to_owned())));
             self.styled(&format!("[image: {label}]"), tag, "", "");
@@ -494,6 +700,21 @@ impl Renderer {
         self.children.push((anchor, picture.upcast()));
     }
 
+    /// A diagram on a centred line of its own.
+    fn figure(&mut self, widget: gtk::Widget) {
+        self.end_line();
+        let mut end = self.buffer.end_iter();
+        let anchor = self.buffer.create_child_anchor(&mut end);
+        let mut start = end;
+        start.backward_char();
+        self.buffer.apply_tag(&self.styles.figure, &start, &end);
+        self.children.push((anchor, widget));
+        self.end_line();
+        if self.quote_depth == 0 {
+            self.gap();
+        }
+    }
+
     /// Ends the current line unless the buffer is empty or already at a line start.
     fn end_line(&mut self) {
         let mut end = self.buffer.end_iter();
@@ -503,16 +724,18 @@ impl Renderer {
         }
     }
 
-    fn indent(&mut self, depth: usize, rtl: bool) -> gtk::TextTag {
+    /// A list item's indent: its depth's margin, with the first line pulled back by `hang`
+    /// pixels so the marker sits in the margin and wrapped lines line up with the text.
+    fn indent(&mut self, depth: usize, hang: i32, rtl: bool) -> gtk::TextTag {
         let table = self.buffer.tag_table();
         self.indents
-            .entry((depth, rtl))
+            .entry((depth, hang, rtl))
             .or_insert_with(|| {
-                let margin = MARGIN + 6 + 22 * (depth.max(1) as i32 - 1);
+                let margin = self.margin + 6 + 22 * (depth.max(1) as i32 - 1) + hang;
                 let tag = if rtl {
-                    gtk::TextTag::builder().right_margin(margin).pixels_below_lines(4).build()
+                    gtk::TextTag::builder().right_margin(margin).indent(-hang).pixels_below_lines(4).build()
                 } else {
-                    gtk::TextTag::builder().left_margin(margin).pixels_below_lines(4).build()
+                    gtk::TextTag::builder().left_margin(margin).indent(-hang).pixels_below_lines(4).build()
                 };
                 table.add(&tag);
                 tag
@@ -559,25 +782,105 @@ impl Renderer {
         self.buffer.set_modified(false);
         let start = self.buffer.start_iter();
         self.buffer.place_cursor(&start);
-        Rendered { buffer: self.buffer, targets: self.targets, children: self.children }
+        Rendered {
+            buffer: self.buffer,
+            targets: self.targets,
+            children: self.children,
+            headings: self.headings,
+            code: self.code,
+        }
     }
 
     /// List indents are on the left; move them to the right on right-to-left lines.
     fn mirror_rtl_indents(&mut self) {
-        let ltr: Vec<(usize, gtk::TextTag)> =
-            self.indents.iter().filter(|((_, rtl), _)| !rtl).map(|((d, _), t)| (*d, t.clone())).collect();
+        let ltr: Vec<((usize, i32), gtk::TextTag)> = self
+            .indents
+            .iter()
+            .filter(|((_, _, rtl), _)| !rtl)
+            .map(|((depth, hang, _), tag)| ((*depth, *hang), tag.clone()))
+            .collect();
         for line in 0..self.buffer.line_count() {
             let Some(start) = self.buffer.iter_at_line(line) else { continue };
-            let Some((depth, tag)) = ltr.iter().find(|(_, tag)| start.has_tag(tag)) else { continue };
+            let Some(((depth, hang), tag)) = ltr.iter().find(|(_, tag)| start.has_tag(tag)) else { continue };
             let mut end = start;
             end.forward_to_line_end();
             if pango::find_base_dir(&self.buffer.text(&start, &end, false)) == pango::Direction::Rtl {
-                let rtl = self.indent(*depth, true);
+                let rtl = self.indent(*depth, *hang, true);
                 self.buffer.remove_tag(tag, &start, &end);
                 self.buffer.apply_tag(&rtl, &start, &end);
             }
         }
     }
+}
+
+/// Colours fenced code blocks with GtkSourceView's highlighting for their language. Meant to
+/// run after the first frame: loading the language definitions takes ~100 ms.
+pub fn highlight_code(buffer: &sourceview::Buffer, blocks: &[CodeBlock], scheme: Option<&sourceview::StyleScheme>) {
+    let table = buffer.tag_table();
+    let mut colours: HashMap<String, gtk::TextTag> = HashMap::new();
+    for block in blocks {
+        let start = buffer.iter_at_mark(&block.start);
+        let code = buffer.text(&start, &buffer.iter_at_mark(&block.end), false);
+        let base = start.offset() as usize;
+        for (range, colour) in code_colours(&block.language, &code, scheme) {
+            let tag = colours.entry(colour.to_string()).or_insert_with(|| {
+                let tag = gtk::TextTag::builder().foreground_rgba(&colour).build();
+                table.add(&tag);
+                tag
+            });
+            let at = |offset: usize| buffer.iter_at_offset((base + offset) as i32);
+            buffer.apply_tag(tag, &at(range.start), &at(range.end));
+        }
+    }
+}
+
+/// How GtkSourceView colours `code` as `language` (a fence's name: "rust", "py", "sh"…):
+/// character ranges and their colours. Nothing for a language it doesn't know.
+pub fn code_colours(language: &str, code: &str, scheme: Option<&sourceview::StyleScheme>) -> Vec<(Range<usize>, gdk::RGBA)> {
+    let manager = sourceview::LanguageManager::default();
+    let Some(language) = self::language(&manager, language) else { return Vec::new() };
+    // Highlighted in a scratch buffer, its colours read back.
+    let scratch = sourceview::Buffer::new(None);
+    scratch.set_style_scheme(scheme);
+    scratch.set_language(Some(&language));
+    scratch.set_text(code);
+    scratch.ensure_highlight(&scratch.start_iter(), &scratch.end_iter());
+    let mut found = Vec::new();
+    let mut iter = scratch.start_iter();
+    loop {
+        let from = iter.offset() as usize;
+        let colour = foreground(&iter);
+        let more = iter.forward_to_tag_toggle(None::<&gtk::TextTag>);
+        if let Some(colour) = colour {
+            found.push((from..iter.offset() as usize, colour));
+        }
+        if !more {
+            break;
+        }
+    }
+    found
+}
+
+/// The colour the highlighting gives the text at `iter`, if any.
+fn foreground(iter: &gtk::TextIter) -> Option<gdk::RGBA> {
+    iter.tags().into_iter().rev().find(|tag| tag.is_foreground_set()).and_then(|tag| tag.foreground_rgba())
+}
+
+/// GtkSourceView's language for a fence's name: its id, a common alias, or a file extension.
+fn language(manager: &sourceview::LanguageManager, name: &str) -> Option<sourceview::Language> {
+    let name = name.to_ascii_lowercase();
+    let id = match name.as_str() {
+        "py" | "python" => "python3",
+        "js" | "javascript" => "js",
+        "ts" => "typescript",
+        "sh" | "bash" | "shell" | "zsh" | "console" => "sh",
+        "rs" => "rust",
+        "yml" => "yaml",
+        "c++" => "cpp",
+        "md" => "markdown",
+        other => other,
+    };
+    manager.language(id).or_else(|| manager.guess_language(Some(format!("file.{name}")), None))
 }
 
 fn heading_index(level: HeadingLevel) -> usize {

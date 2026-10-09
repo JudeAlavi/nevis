@@ -4,8 +4,19 @@ version = "0.1.0"
 edition = "2024"
 description = "A fast, minimal text and Markdown editor (GTK4 + GtkSourceView)"
 license = "MIT"
+# Two programs: `nevis` (the quick launcher you run) and `nevis-app` (the GTK app).
+autobins = false
+
+[[bin]]
+name = "nevis"
+path = "src/launcher.rs"
+
+[[bin]]
+name = "nevis-app"
+path = "src/main.rs"
 
 [dependencies]
+gio = "0.22"
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 sourceview = { package = "sourceview5", version = "0.11" }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["simd"] }

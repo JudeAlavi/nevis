@@ -18,12 +18,24 @@ const fn row(what: &'static str, action: &'static str, also: &'static str) -> Ro
 
 const LEFT: &[(&str, &[Row])] = &[
     ("File", &[
+        row("New note (named, in a folder window)", "win.new-note", ""),
+        row("New tab", "win.new-tab", ""),
         row("New window", "app.new-window", ""),
         row("Open a file", "win.open", ""),
+        row("Open a folder", "win.open-folder", ""),
+        row("Go to a file in the folder", "win.quick-open", ""),
+        row("Search in the folder", "win.search", ""),
         row("Save", "win.save", ""),
         row("Save as", "win.save-as", ""),
-        row("Close window", "win.close", ""),
-        row("Close all windows", "app.quit", ""),
+        row("Close tab", "win.close", ""),
+        row("Reopen closed tab", "win.reopen-tab", ""),
+        row("Close window", "win.close-window", ""),
+        row("Quit, keeping every tab", "app.quit", ""),
+    ]),
+    ("Tabs", &[
+        row("Next / previous tab", "win.next-tab", "Ctrl+Shift+Tab"),
+        row("Tab 1 … 8, last tab", "win.tab-1", "… Alt+9"),
+        row("Move tab left / right", "win.move-tab-left", "Ctrl+Shift+Page Down"),
     ]),
     ("Find", &[
         row("Find", "win.find", ""),
@@ -41,11 +53,19 @@ const LEFT: &[(&str, &[Row])] = &[
 const RIGHT: &[(&str, &[Row])] = &[
     ("View", &[
         row("Rendered view ⇄ source", "win.reading", ""),
+        row("Folder sidebar", "win.sidebar", ""),
+        row("Settings (theme, text size…)", "win.settings", ""),
         row("Line numbers", "win.line-numbers", ""),
         row("Word wrap", "win.wrap", ""),
-        row("Zoom in", "win.zoom-in", "Ctrl+scroll"),
-        row("Zoom out", "win.zoom-out", ""),
-        row("Reset zoom", "win.zoom-reset", ""),
+        row("Larger text", "win.zoom-in", "Ctrl+scroll"),
+        row("Smaller text", "win.zoom-out", ""),
+        row("Default text size", "win.zoom-reset", ""),
+    ]),
+    ("Notes", &[
+        row("Go to a heading", "win.outline", ""),
+        row("Today's note (in a folder window)", "win.daily", ""),
+        row("Make a link (or paste an address over words)", "win.link", ""),
+        row("Paste a screenshot (saved in attachments/)", "", "Ctrl+V"),
     ]),
     ("Editing", &[
         row("Undo / redo", "", "Ctrl+Z / Shift+Ctrl+Z"),

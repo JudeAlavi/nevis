@@ -31,10 +31,12 @@ impl FindBar {
         let next = button("↓", "Next match (Enter, F3)");
         let count = gtk::Label::builder().width_chars(10).css_classes(["dim-label"]).build();
         let case = gtk::ToggleButton::builder().label("Aa").tooltip_text("Match case").css_classes(["flat"]).build();
+        let underlined = gtk::Label::builder().use_markup(true).label("<u>ab</u>").build();
+        let word = gtk::ToggleButton::builder().child(&underlined).tooltip_text("Whole words").css_classes(["flat"]).build();
         let regex = gtk::ToggleButton::builder().label(".*").tooltip_text("Regular expression").css_classes(["flat"]).build();
         let close = button("✕", "Close (Esc)");
         let find_row = row(&[entry.upcast_ref(), prev.upcast_ref(), next.upcast_ref(), count.upcast_ref(),
-                             case.upcast_ref(), regex.upcast_ref(), close.upcast_ref()]);
+                             case.upcast_ref(), word.upcast_ref(), regex.upcast_ref(), close.upcast_ref()]);
 
         let replace_entry = gtk::Entry::builder().placeholder_text("Replace with").hexpand(true).build();
         let replace_one = gtk::Button::with_label("Replace");
@@ -92,6 +94,12 @@ impl FindBar {
         case.connect_toggled(move |t| {
             settings.set_case_sensitive(t.is_active());
             on_case();
+        });
+        let settings = bar.settings.clone();
+        let on_word = with(Self::search_changed);
+        word.connect_toggled(move |t| {
+            settings.set_at_word_boundaries(t.is_active());
+            on_word();
         });
         let settings = bar.settings.clone();
         let on_regex = with(Self::search_changed);

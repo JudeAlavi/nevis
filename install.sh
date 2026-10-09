@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build nevis and install it for the current user:
-#   ~/.local/bin/nevis, its desktop entry, and a systemd user service that keeps it running.
+#   ~/.local/bin/nevis (launcher) and nevis-app, the desktop entry, and a systemd user
+#   service that keeps nevis-app running.
 # Set NEVIS_DEFAULT=0 to skip making it the default app for .txt and .md files.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -13,6 +14,7 @@ units="$HOME/.config/systemd/user"
 cargo build --release -j "${JOBS:-6}"
 
 install -Dm755 target/release/nevis "$bindir/nevis"
+install -Dm755 target/release/nevis-app "$bindir/nevis-app"
 mkdir -p "$apps" "$units"
 first_install=true
 [[ -e "$units/nevis.service" ]] && first_install=false

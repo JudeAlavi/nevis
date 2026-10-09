@@ -2,12 +2,16 @@
 Description=nevis text editor, kept running so files open instantly
 PartOf=graphical-session.target
 After=graphical-session.target
+# The compositor restarting takes nevis down with it; give it time to come back.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=dbus
 BusName=dev.shirvani.Nevis
-ExecStart=@BINDIR@/nevis --gapplication-service
+ExecStart=@BINDIR@/nevis-app --gapplication-service
 Restart=on-failure
+RestartSec=3
 
 [Install]
 WantedBy=graphical-session.target

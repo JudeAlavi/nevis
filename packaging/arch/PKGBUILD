@@ -1,0 +1,45 @@
+# A package of this checkout, as it is on disk: `cd packaging/arch && makepkg -si`.
+# Builds from the working tree (no download, uncommitted changes included) into ./src.
+
+pkgname=nevis
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Fast, minimal text and Markdown editor; Persian and other right-to-left text per paragraph'
+arch=('x86_64')
+license=('LicenseRef-none') # no license chosen yet
+depends=('gtk4' 'gtksourceview5' 'glib2' 'pango' 'cairo' 'gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=('vazirmatn-fonts: Persian text in its intended font'
+            'inter-font: the rendered view'
+            'ttf-jetbrains-mono: the source view'
+            'libspelling: spell checking'
+            'hunspell-en_us: an English dictionary for spell checking'
+            'hunspell-it: an Italian dictionary for spell checking')
+
+_tree="$(realpath "$startdir/../..")"
+
+prepare() {
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --manifest-path "$_tree/Cargo.toml" --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  export RUSTUP_TOOLCHAIN=stable
+  # Few jobs: this laptop overheats on all-core builds.
+  cargo build --frozen --release --manifest-path "$_tree/Cargo.toml" --target-dir "$srcdir/target" -j "${NEVIS_JOBS:-6}"
+}
+
+check() {
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release --manifest-path "$_tree/Cargo.toml" --target-dir "$srcdir/target" -j "${NEVIS_JOBS:-6}" --bin nevis-app
+}
+
+package() {
+  install -Dm755 "$srcdir/target/release/nevis" "$pkgdir/usr/bin/nevis"
+  install -Dm755 "$srcdir/target/release/nevis-app" "$pkgdir/usr/bin/nevis-app"
+  sed 's|@BINDIR@|/usr/bin|' "$_tree/data/dev.shirvani.Nevis.desktop.in" |
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/dev.shirvani.Nevis.desktop"
+  sed 's|@BINDIR@|/usr/bin|' "$_tree/data/nevis.service.in" |
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/nevis.service"
+  install -Dm644 "$_tree/README.md" "$pkgdir/usr/share/doc/nevis/README.md"
+}
