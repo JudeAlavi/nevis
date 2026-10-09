@@ -132,7 +132,7 @@ edits, you're asked), and each file reopens where its cursor was.
 | Ctrl+E | rendered view ⇄ source |
 | Ctrl+T / Ctrl+W / Ctrl+Shift+T | new tab / close tab / reopen closed tab |
 | Ctrl+Tab, Ctrl+Shift+Tab, Alt+1…9 | next / previous / numbered tab (Alt+9: last) |
-| Ctrl+Shift+Page Up / Page Down | move the tab left / right |
+| Ctrl+Shift+Page Up / Page Down | move the tab left / right (or drag it along the bar) |
 | Ctrl+N | new note: named, in a folder window; elsewhere an empty tab |
 | Ctrl+Shift+N / Ctrl+Shift+W / Ctrl+Q | new window / close window / quit, keeping every tab |
 | Ctrl+O / Ctrl+Shift+O | open file / open folder |
@@ -239,4 +239,4 @@ Dev hooks (environment variables, no effect otherwise; `nevis` passes them to `n
 
 ## Next
 
-- Mermaid sequence diagrams; tabs dragged to reorder.
+- Mermaid sequence diagrams.

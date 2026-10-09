@@ -256,8 +256,14 @@ impl Window {
     fn move_tab(&self, by: i32) {
         let Some(editor) = self.current() else { return };
         let Some(index) = self.index_of(&editor) else { return };
-        let count = self.editors.borrow().len() as i32;
-        let target = (index as i32 + by).clamp(0, count - 1) as usize;
+        self.move_tab_to(&editor, (index as i32 + by).max(0) as usize);
+        self.scroll_to_tab(&editor);
+    }
+
+    /// Moves `editor`'s tab to place `target` along the bar (the last, if past it).
+    fn move_tab_to(&self, editor: &Rc<Editor>, target: usize) {
+        let Some(index) = self.index_of(editor) else { return };
+        let target = target.min(self.editors.borrow().len() - 1);
         if target == index {
             return;
         }
@@ -266,8 +272,20 @@ impl Window {
         // The bar shows the tabs in the list's order.
         let before = if target == 0 { None } else { Some(self.editors.borrow()[target - 1].tab.clone()) };
         self.bar.reorder_child_after(&editor.tab, before.as_ref());
-        self.scroll_to_tab(&editor);
         self.tabs_changed();
+    }
+
+    /// The tab at `x`, `y` in the bar.
+    fn tab_at(&self, x: f64, y: f64) -> Option<Rc<Editor>> {
+        let point = gtk::graphene::Point::new(x as f32, y as f32);
+        self.tabs().into_iter().find(|editor| editor.tab.compute_bounds(&self.bar).is_some_and(|bounds| bounds.contains_point(&point)))
+    }
+
+    /// Where the middle of the tab at place `index` is, along the bar.
+    fn middle_of(&self, index: usize) -> Option<f64> {
+        let editor = self.editors.borrow().get(index)?.clone();
+        let bounds = editor.tab.compute_bounds(&self.bar)?;
+        Some(f64::from(bounds.x() + bounds.width() / 2.0))
     }
 
     /// A new, empty note in a tab of its own.
@@ -531,6 +549,34 @@ impl Window {
     }
 
     fn connect_signals(self: &Rc<Self>) {
+        // A tab dragged along the bar takes the place of each one whose middle it passes (and
+        // can't flip back and forth over a wide one). The × takes its own clicks.
+        let drag = gtk::GestureDrag::new();
+        let dragged: Rc<RefCell<Option<Rc<Editor>>>> = Rc::default();
+        let (weak, held) = (Rc::downgrade(self), dragged.clone());
+        drag.connect_drag_begin(move |_, x, y| {
+            *held.borrow_mut() = weak.upgrade().and_then(|this| this.tab_at(x, y));
+        });
+        let (weak, held) = (Rc::downgrade(self), dragged.clone());
+        drag.connect_drag_update(move |gesture, dx, _| {
+            let (Some(this), Some(editor)) = (weak.upgrade(), held.borrow().clone()) else { return };
+            let threshold = gtk::Settings::default().map_or(8, |settings| settings.gtk_dnd_drag_threshold());
+            let Some((start, _)) = gesture.start_point() else { return };
+            if dx.abs() < f64::from(threshold) {
+                return;
+            }
+            let Some(index) = this.index_of(&editor) else { return };
+            let x = start + dx;
+            if this.middle_of(index + 1).is_some_and(|middle| x > middle) {
+                this.move_tab_to(&editor, index + 1);
+            } else if index > 0 && this.middle_of(index - 1).is_some_and(|middle| x < middle) {
+                this.move_tab_to(&editor, index - 1);
+            }
+        });
+        drag.connect_drag_end(move |_, _, _| {
+            dragged.borrow_mut().take();
+        });
+        self.bar.add_controller(drag);
         // The mouse wheel scrolls an overflowing tab bar sideways.
         let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
         let scroller = self.bar_scroller.downgrade();
