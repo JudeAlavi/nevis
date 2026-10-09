@@ -42,6 +42,8 @@ mod imp {
         /// Tags keeping room above a line, by height.
         pub rooms: RefCell<HashMap<i32, gtk::TextTag>>,
         pub finder: RefCell<Option<Finder>>,
+        /// Callout titles as Pango markup, by their Markdown.
+        pub titles: RefCell<HashMap<String, String>>,
         /// The width and text size blocks were last placed for.
         pub width: Cell<i32>,
         pub size: Cell<i32>,
@@ -276,6 +278,18 @@ impl Paper {
                 Some(Drawing::Table(cells, columns, rows))
             }
         }
+    }
+
+    /// A callout title's Markdown as Pango markup, bold, worked out once.
+    fn title_markup(&self, title: &str) -> String {
+        if let Some(markup) = self.imp().titles.borrow().get(title) {
+            return markup.clone();
+        }
+        let finder = self.imp().finder.borrow();
+        let find = |path: &str| finder.as_ref().and_then(|find| find(path));
+        let markup = format!("<b>{}</b>", render::inline_markup(title, &find, &|text| self.body_layout(text)));
+        self.imp().titles.borrow_mut().insert(title.to_owned(), markup.clone());
+        markup
     }
 
     /// A layout for `text` in the rendered view's font, at this view's size.
@@ -527,10 +541,8 @@ fn draw_marks(view: &Paper, marks: &[(Range<usize>, Mark)], snapshot: &gtk::Snap
                 snapshot.append_color(&render::rgba(colors.rule, 1.0), &line);
             }
             Mark::Title(title, kind) => {
-                let layout = view.create_pango_layout(Some(title));
-                let bold = pango::AttrList::new();
-                bold.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-                layout.set_attributes(Some(&bold));
+                let layout = view.create_pango_layout(None);
+                layout.set_markup(&view.title_markup(title));
                 snapshot.save();
                 snapshot.translate(&graphene::Point::new(x, y));
                 snapshot.append_layout(&layout, &render::rgba(render::callout_color(kind), 1.0));

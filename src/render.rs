@@ -462,12 +462,14 @@ impl<'m> Renderer<'m> {
                     self.targets.push((header.clone(), Target::Fold(fold.clone())));
                     fold
                 });
-                let title = match callout.fold {
-                    Some(true) => format!("{}  \u{2212}", callout.title),
-                    Some(false) => format!("{}  +", callout.title),
-                    None => callout.title,
-                };
-                self.styled(&title, header, "", "");
+                // The title's own Markdown (bold, code, links…) drawn too.
+                let mut title = inline_markup(&callout.title, self.find, self.text);
+                match callout.fold {
+                    Some(true) => title.push_str("  \u{2212}"),
+                    Some(false) => title.push_str("  +"),
+                    None => {}
+                }
+                self.markup(&title, &header);
                 self.end_line();
                 if let Some(fold) = fold {
                     let end = self.buffer.end_iter();
@@ -715,7 +717,8 @@ impl<'m> Renderer<'m> {
                 Mark::Highlight => {
                     let (inner_start, inner_end) = ((mark.start + 2).max(start), (mark.end - 2).min(range.end));
                     if inner_start < inner_end {
-                        self.styled(&source[inner_start..inner_end], self.styles.highlight.clone(), "", "");
+                        let open = format!("<span background=\"{}\" bgalpha=\"32%\">", theme::colors().changed.to_hex());
+                        self.styled(&source[inner_start..inner_end], self.styles.highlight.clone(), &open, "</span>");
                     }
                 }
                 // Left out, and a space after it too when one comes before it.
@@ -809,6 +812,27 @@ impl<'m> Renderer<'m> {
         self.close_panel();
         self.gap();
         true
+    }
+
+    /// `markup` (Pango's) at the end, in `tag` and the tags in force: a callout's title.
+    fn markup(&mut self, markup: &str, tag: &gtk::TextTag) {
+        if self.pending_bullet {
+            self.bullet();
+        }
+        // A text buffer knows neither of the attributes Pango's <sup> and <sub> make (it warns,
+        // and leaves the script level): raised and smaller instead.
+        let markup = markup
+            .replace("<sup>", "<span rise=\"4000\" size=\"smaller\">")
+            .replace("<sub>", "<span rise=\"-2000\" size=\"smaller\">")
+            .replace("</sup>", "</span>")
+            .replace("</sub>", "</span>");
+        let start = self.buffer.end_iter().offset();
+        let mut end = self.buffer.end_iter();
+        self.buffer.insert_markup(&mut end, &markup);
+        let start = self.buffer.iter_at_offset(start);
+        for tag in self.frame.iter().chain(&self.block).chain(&self.inline).chain([tag]) {
+            self.buffer.apply_tag(tag, &start, &end);
+        }
     }
 
     /// `#tag`, as a small clickable label that searches for it.
@@ -1403,6 +1427,21 @@ pub fn table(source: &str, find: &dyn Fn(&str) -> Option<gio::File>, text: &dyn 
         r.event(event, range);
     }
     r.tables?.into_iter().next()
+}
+
+/// `source`'s inline Markdown (bold, italic, code, links, formulas…) as Pango markup, as table
+/// cells are written: a callout's title.
+pub fn inline_markup(source: &str, find: &dyn Fn(&str) -> Option<gio::File>, text: &dyn Fn(&str) -> pango::Layout) -> String {
+    let mut r = Renderer::new(None, find, sourceview::Buffer::new(None), text, 0);
+    r.table = Some(Table { aligns: Vec::new(), rows: vec![(false, vec![Cell::default()])], head: false });
+    let (shown, additions) = prepare(source);
+    r.read(&shown, additions);
+    for (event, range) in events(&shown) {
+        if !matches!(event, Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph)) {
+            r.event(event, range);
+        }
+    }
+    r.cell().map(|cell| std::mem::take(&mut cell.markup)).unwrap_or_default()
 }
 
 /// A formula (what is between the dollar signs) as Pango markup: its runs raised or lowered,
