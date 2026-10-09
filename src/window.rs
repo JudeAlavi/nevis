@@ -1354,6 +1354,9 @@ pub fn init() {
             if new.spell_check != old.spell_check {
                 editor.set_spell_check(new.spell_check);
             }
+            if new.live_preview != old.live_preview {
+                editor.set_live_preview(new.live_preview);
+            }
         }
         let windows = WINDOWS.with_borrow(|windows| windows.clone());
         windows.iter().for_each(|window| window.settings_changed());

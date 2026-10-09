@@ -83,6 +83,15 @@ pub struct Styler {
     coloured: RefCell<Vec<(String, String)>>,
     /// With spell checking on: the tag spell checking skips, kept on code and Persian.
     unspelled: RefCell<Option<gtk::TextTag>>,
+    /// Live Preview: the tag that hides markup, whether it is on, the text and spans styled
+    /// last (what is hidden is worked out from them), the lines being edited when it was, and
+    /// whether it waits (typing through an input method, dragging a selection).
+    hide: gtk::TextTag,
+    live: Cell<bool>,
+    styled: RefCell<Option<(String, Spans)>>,
+    editing: Cell<Option<(usize, usize)>>,
+    composing: Cell<bool>,
+    dragging: Cell<bool>,
 }
 
 impl Styler {
@@ -96,8 +105,16 @@ impl Styler {
                 tag
             })
             .collect();
+        let hide = gtk::TextTag::builder().invisible(true).build();
+        table.add(&hide);
         let styler = Rc::new(Self {
             buffer: buffer.clone(),
+            hide,
+            live: Cell::new(false),
+            styled: RefCell::new(None),
+            editing: Cell::new(None),
+            composing: Cell::new(false),
+            dragging: Cell::new(false),
             tags,
             enabled: Cell::new(false),
             queued: Cell::new(false),
@@ -117,6 +134,65 @@ impl Styler {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.get()
+    }
+
+    /// Live Preview on or off: markup hidden except where the cursor is.
+    pub fn set_live(&self, on: bool) {
+        self.live.set(on);
+        self.editing.set(None);
+        self.rehide();
+    }
+
+    /// The cursor or the selection moved: the lines shown as written may change.
+    pub fn cursor_moved(&self) {
+        if self.live.get() && self.editing_lines() != self.editing.get() {
+            self.rehide();
+        }
+    }
+
+    /// While text is composed through an input method, or a selection dragged, what is hidden
+    /// stays as it is (text moving under the pointer or the composition would be a mess).
+    pub fn set_composing(&self, on: bool) {
+        self.composing.set(on);
+        if !on {
+            self.rehide();
+        }
+    }
+
+    pub fn set_dragging(&self, on: bool) {
+        self.dragging.set(on);
+        if !on {
+            self.rehide();
+        }
+    }
+
+    /// The first and last lines of the selection, or the cursor's line.
+    fn editing_lines(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.buffer.selection_bounds().unwrap_or_else(|| {
+            let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
+            (cursor, cursor)
+        });
+        Some((start.line() as usize, end.line() as usize))
+    }
+
+    /// Hides the markup Live Preview hides now (`hidden`), changing only what differs.
+    fn rehide(&self) {
+        if self.composing.get() || self.dragging.get() {
+            return;
+        }
+        let editing = self.editing_lines();
+        self.editing.set(editing);
+        let want = match (&*self.styled.borrow(), editing) {
+            (Some((text, spans)), Some((first, last))) if self.live.get() && self.enabled.get() => hidden(text, spans, first..=last),
+            _ => Vec::new(),
+        };
+        let have = tagged(&self.buffer, &self.hide);
+        for range in subtract(&have, &want) {
+            self.buffer.remove_tag(&self.hide, &self.iter_at(range.start), &self.iter_at(range.end));
+        }
+        for range in subtract(&want, &have) {
+            self.buffer.apply_tag(&self.hide, &self.iter_at(range.start), &self.iter_at(range.end));
+        }
     }
 
     /// Whether `iter` is inside a code block or the front matter, where text is taken as is.
@@ -200,6 +276,8 @@ impl Styler {
                 self.buffer.apply_tag(tag, &self.iter_at(range.start), &self.iter_at(range.end));
             }
         }
+        *self.styled.borrow_mut() = Some((text.to_string(), wanted.clone()));
+        self.rehide();
         if devhooks::active() {
             devhooks::lap(&format!("markdown styled in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0));
             for (kind, tag) in ALL.iter().zip(&self.tags) {
@@ -224,6 +302,8 @@ impl Styler {
         for tag in &self.tags {
             self.buffer.remove_tag(tag, &start, &end);
         }
+        self.styled.borrow_mut().take();
+        self.buffer.remove_tag(&self.hide, &start, &end);
         self.uncolour();
     }
 
@@ -418,7 +498,8 @@ fn subtract(a: &[Range<usize>], b: &[Range<usize>]) -> Vec<Range<usize>> {
 /// Character ranges (not bytes) for each kind, sorted and merged; and the fenced code blocks
 /// that name a language, to colour as that language.
 #[derive(Debug, Default)]
-pub struct Spans([Vec<Range<usize>>; KINDS], Vec<Fence>);
+#[derive(Clone)]
+pub struct Spans([Vec<Range<usize>>; KINDS], Vec<Fence>, Vec<Range<usize>>);
 
 /// A fenced code block's language, and the character ranges its code is in: one, or a piece
 /// per line inside a quote or a list (their markers aren't code).
@@ -436,6 +517,53 @@ impl Spans {
     pub fn fences(&self) -> &[Fence] {
         &self.1
     }
+
+    /// Tables, math and rules: markup that Live Preview leaves as written.
+    pub fn as_written(&self) -> &[Range<usize>] {
+        &self.2
+    }
+}
+
+/// What Live Preview hides of `source` (styled as `spans`) while the lines `editing` (those
+/// with the cursor or the selection) are worked on: the markup around formatted text (heading
+/// `#`s, `**`, backticks, `[`…`](url)`, `>`, code fences), except on those lines and in a code
+/// block they touch. Tables, math, rules, HTML and front matter stay as written, and so does a
+/// link with no words. Character ranges, sorted, never across a line's end.
+pub fn hidden(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<usize>) -> Vec<Range<usize>> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut starts = vec![0];
+    starts.extend(chars.iter().enumerate().filter(|(_, c)| **c == '\n').map(|(i, _)| i + 1));
+    let line = |n: usize| starts.get(n).copied().unwrap_or(chars.len() + 1);
+    let edited = line(*editing.start())..line(editing.end() + 1);
+    let overlap = |a: &Range<usize>, b: &Range<usize>| a.start < b.end && b.start < a.end;
+    // A code block with an edited line shows whole, fences and all.
+    let blocks: Vec<&Range<usize>> = spans.of(Kind::CodeBlock).iter().filter(|block| overlap(block, &edited)).collect();
+    let kept: Vec<&Range<usize>> =
+        spans.as_written().iter().chain(spans.of(Kind::Html)).chain(spans.of(Kind::Frontmatter)).collect();
+    let mut hidden = Vec::new();
+    let markers = spans.of(Kind::Marker).iter().map(|range| (range, false));
+    for (range, address) in markers.chain(spans.of(Kind::Url).iter().map(|range| (range, true))) {
+        // A link with no words is all address: hiding it would leave nothing.
+        let wordless = address && matches!(chars.get(range.start), Some('[' | '!'));
+        if wordless || overlap(range, &edited) || blocks.iter().any(|b| overlap(range, b)) || kept.iter().any(|k| overlap(range, k)) {
+            continue;
+        }
+        // Never a line's end: hidden, it would join two lines.
+        let mut start = range.start;
+        for i in range.clone() {
+            if chars.get(i) == Some(&'\n') {
+                if start < i {
+                    hidden.push(start..i);
+                }
+                start = i + 1;
+            }
+        }
+        if start < range.end {
+            hidden.push(start..range.end);
+        }
+    }
+    hidden.sort_by_key(|range| range.start);
+    hidden
 }
 
 /// Works out how each part of `source` should look.
@@ -490,15 +618,27 @@ pub fn spans(source: &str) -> Spans {
                 let ticks = source[range.clone()].bytes().take_while(|&b| b == b'`').count();
                 wrapped(Kind::Code, range, ticks, &mut out);
             }
-            Event::InlineMath(_) => wrapped(Kind::Code, range, 1, &mut out),
-            Event::DisplayMath(_) => wrapped(Kind::Code, range, 2, &mut out),
+            Event::InlineMath(_) => {
+                out.keep(range.clone());
+                wrapped(Kind::Code, range, 1, &mut out);
+            }
+            Event::DisplayMath(_) => {
+                out.keep(range.clone());
+                wrapped(Kind::Code, range, 2, &mut out);
+            }
             Event::Start(Tag::CodeBlock(kind)) => code_block(source, range, kind.is_fenced(), &mut out),
             Event::Start(Tag::Item) => list_marker(source, range, &mut out),
             Event::Start(Tag::BlockQuote(_)) => quote(source, range, &mut out),
-            Event::Start(Tag::Table(_)) => table(source, range, &mut out),
+            Event::Start(Tag::Table(_)) => {
+                out.keep(range.clone());
+                table(source, range, &mut out);
+            }
             Event::Start(Tag::TableHead) => out.push(Kind::Strong, without_newline(source, range)),
             Event::Start(Tag::MetadataBlock(_)) => out.push(Kind::Frontmatter, without_newline(source, range)),
-            Event::Rule => out.push(Kind::Marker, without_newline(source, range)),
+            Event::Rule => {
+                out.keep(range.clone());
+                out.push(Kind::Marker, without_newline(source, range));
+            }
             Event::Start(Tag::HtmlBlock) | Event::InlineHtml(_) => {
                 out.push(Kind::Html, without_newline(source, range));
             }
@@ -651,6 +791,8 @@ struct Collector {
     ranges: [Vec<Range<usize>>; KINDS],
     /// Fenced code: language and byte ranges.
     fences: Vec<(String, Vec<Range<usize>>)>,
+    /// Tables, math and rules (byte ranges): left as written in Live Preview.
+    written: Vec<Range<usize>>,
 }
 
 impl Collector {
@@ -658,6 +800,10 @@ impl Collector {
         if range.start < range.end {
             self.ranges[kind as usize].push(range);
         }
+    }
+
+    fn keep(&mut self, range: Range<usize>) {
+        self.written.push(range);
     }
 
     /// Character ranges, sorted, with overlapping or touching ones merged.
@@ -681,7 +827,8 @@ impl Collector {
             }
             merged
         });
-        Spans(ranges, fences)
+        let written = self.written.into_iter().map(|r| char_at(r.start)..char_at(r.end)).collect();
+        Spans(ranges, fences, written)
     }
 }
 
@@ -818,6 +965,30 @@ mod tests {
         assert!(s.of(Kind::Frontmatter).is_empty());
         assert_eq!(s.of(Kind::H1), &[7..14]);
         assert_eq!(s.of(Kind::Marker), &[3..6, 7..9, 15..18]);
+    }
+
+    #[test]
+    fn live_preview_hides_markup_except_on_the_lines_being_edited() {
+        let text = "# Title\nSome **bold** and `code`.\n\nlast";
+        let s = spans(text);
+        assert_eq!(hidden(text, &s, 3..=3), vec![0..2, 13..15, 19..21, 26..27, 31..32]);
+        assert_eq!(hidden(text, &s, 1..=1), vec![0..2]);
+        assert_eq!(hidden(text, &s, 0..=1), Vec::<Range<usize>>::new());
+    }
+
+    #[test]
+    fn live_preview_keeps_a_links_words_and_the_address_of_a_link_without_words() {
+        let text = "[the plan](Plans.md) [[Note|alias]] [](x.md)";
+        let s = spans(text);
+        assert_eq!(hidden(text, &s, 5..=5), vec![0..1, 9..20, 21..28, 33..35]);
+    }
+
+    #[test]
+    fn live_preview_shows_a_code_block_being_edited_and_leaves_tables_math_and_rules() {
+        let text = "```rust\nlet x = 1;\n```\n\n| a | b |\n|---|---|\n\n$x^2$ and more\n\n---\n";
+        let s = spans(text);
+        assert_eq!(hidden(text, &s, 9..=9), vec![0..7, 19..22]);
+        assert_eq!(hidden(text, &s, 1..=1), Vec::<Range<usize>>::new());
     }
 
     #[test]

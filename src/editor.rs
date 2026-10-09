@@ -451,12 +451,45 @@ impl Editor {
         // Completion follows the typing and the cursor; it closes when the text loses focus.
         let weak = Rc::downgrade(self);
         self.buffer.connect_mark_set(move |_, _, mark| {
-            if let Some(editor) = weak.upgrade()
-                && mark.name().as_deref() == Some("insert")
-            {
-                editor.queue_completion();
+            let Some(editor) = weak.upgrade() else { return };
+            match mark.name().as_deref() {
+                Some("insert") => {
+                    editor.styler.cursor_moved();
+                    editor.queue_completion();
+                }
+                Some("selection_bound") => editor.styler.cursor_moved(),
+                _ => {}
             }
         });
+        // Live Preview waits while text is composed through an input method, and while a
+        // selection is dragged with the mouse (text would move under the pointer).
+        let weak = Rc::downgrade(self);
+        self.view.connect_preedit_changed(move |_, preedit| {
+            if let Some(editor) = weak.upgrade() {
+                editor.styler.set_composing(!preedit.is_empty());
+            }
+        });
+        let drag = gtk::GestureClick::builder().button(gdk::BUTTON_PRIMARY).propagation_phase(gtk::PropagationPhase::Capture).build();
+        let weak = Rc::downgrade(self);
+        drag.connect_pressed(move |_, _, _, _| {
+            if let Some(editor) = weak.upgrade() {
+                editor.styler.set_dragging(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        drag.connect_released(move |_, _, _, _| {
+            if let Some(editor) = weak.upgrade() {
+                editor.styler.set_dragging(false);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        drag.connect_cancel(move |_, _| {
+            if let Some(editor) = weak.upgrade() {
+                editor.styler.set_dragging(false);
+            }
+        });
+        self.view.add_controller(drag);
+        self.styler.set_live(settings::get().live_preview);
         let focus = gtk::EventControllerFocus::new();
         let weak = Rc::downgrade(self);
         focus.connect_leave(move |_| {
@@ -498,6 +531,11 @@ impl Editor {
 
     pub fn set_wrap(&self, on: bool) {
         self.view.set_wrap_mode(if on { gtk::WrapMode::WordChar } else { gtk::WrapMode::None });
+    }
+
+    /// Live Preview on or off (Settings → Edit Markdown as).
+    pub fn set_live_preview(&self, on: bool) {
+        self.styler.set_live(on);
     }
 
     pub fn set_line_numbers(&self, on: bool) {

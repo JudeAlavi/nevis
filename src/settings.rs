@@ -26,6 +26,9 @@ pub struct Settings {
     pub spell_check: bool,
     /// Text keeps to a readable column in the middle, rather than the window's full width.
     pub centered: bool,
+    /// Markdown is edited in Live Preview (markup hidden except where the cursor is), rather
+    /// than as plain source.
+    pub live_preview: bool,
     /// Text size, in points.
     pub text_size: f64,
 }
@@ -46,6 +49,7 @@ impl Default for Settings {
             autosave: false,
             spell_check: false,
             centered: false,
+            live_preview: true,
             text_size: DEFAULT_TEXT_SIZE,
         }
     }
@@ -115,6 +119,7 @@ fn parse(text: &str) -> Settings {
             "autosave" => settings.autosave = flag.unwrap_or(settings.autosave),
             "spell-check" => settings.spell_check = flag.unwrap_or(settings.spell_check),
             "centered" => settings.centered = flag.unwrap_or(settings.centered),
+            "live-preview" => settings.live_preview = flag.unwrap_or(settings.live_preview),
             "text-size" => {
                 if let Ok(size) = value.parse::<f64>() {
                     settings.text_size = size.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE);
@@ -128,8 +133,8 @@ fn parse(text: &str) -> Settings {
 
 fn to_text(s: &Settings) -> String {
     format!(
-        "wrap = {}\nline-numbers = {}\ncontinue-lists = {}\nopen-rendered = {}\noutside-in-window = {}\ntab-bar-always = {}\nautosave = {}\nspell-check = {}\ncentered = {}\ntext-size = {}\n",
+        "wrap = {}\nline-numbers = {}\ncontinue-lists = {}\nopen-rendered = {}\noutside-in-window = {}\ntab-bar-always = {}\nautosave = {}\nspell-check = {}\ncentered = {}\nlive-preview = {}\ntext-size = {}\n",
         s.wrap, s.line_numbers, s.continue_lists, s.open_rendered, s.outside_in_window, s.tab_bar_always, s.autosave, s.spell_check,
-        s.centered, s.text_size
+        s.centered, s.live_preview, s.text_size
     )
 }

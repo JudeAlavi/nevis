@@ -42,6 +42,12 @@ Enter continues a list (`- `, `3. ` → `4. `, `- [ ] `) or a quote, and Enter o
 ends it. Click a link to follow it (`[[wiki]]`, relative `.md`, `#heading`, `[[Note#Heading]]`)
 or a checkbox to tick it.
 
+**Live Preview.** Editing Markdown (Ctrl+E from the rendered view), the markup hides except
+on the lines with the cursor or the selection, as in Obsidian: headings without their `#`s,
+**bold** without its `**`, links as their words, quotes without `>`, code blocks without their
+fences while the cursor is outside them. Tables, math, rules, HTML and front matter stay as
+written. Settings → Edit Markdown as → Source shows all of it, styled.
+
 **Links, as in Obsidian.** A `[[link]]` or a relative link opens the note beside this one if
 there is one, and otherwise the note of that name anywhere in the vault (the folder holding
 `.obsidian`, or the folder the window shows), case aside; a path (`[[Projects/Plans]]`) has to
