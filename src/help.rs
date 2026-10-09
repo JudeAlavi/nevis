@@ -46,6 +46,7 @@ const LEFT: &[(&str, &[Row])] = &[
     ]),
     ("Help", &[
         row("This cheat sheet", "win.shortcuts", ""),
+        row("Command palette: run any command by name", "win.palette", ""),
         row("Menu", "", "Right-click / Shift+F10"),
     ]),
 ];
@@ -118,6 +119,33 @@ pub fn build(app: &gtk::Application, close: impl Fn() + 'static) -> gtk::Widget 
     backdrop.add_controller(click);
     backdrop.set_visible(false);
     backdrop.upcast()
+}
+
+/// A command the palette offers: what it does, its action, and its keys.
+pub struct Command {
+    pub what: &'static str,
+    pub action: &'static str,
+    pub keys: String,
+}
+
+/// What the palette calls the commands the sheet lists in pairs ("Next / previous tab" runs
+/// the next tab), and the other half of each pair.
+const HALVES: &[(&str, &str)] = &[("win.next-tab", "Next tab"), ("win.move-tab-left", "Move tab left"), ("win.tab-1", "First tab")];
+const OTHER_HALVES: &[Row] = &[row("Previous tab", "win.prev-tab", ""), row("Move tab right", "win.move-tab-right", ""), row("Last tab", "win.tab-9", "")];
+
+/// Every command with an action, in the cheat sheet's order, with its keys (`also` aside:
+/// those are handled elsewhere, as in the find bar).
+pub fn commands(app: &gtk::Application) -> Vec<Command> {
+    LEFT.iter()
+        .chain(RIGHT)
+        .flat_map(|(_, rows)| rows.iter())
+        .chain(OTHER_HALVES)
+        .filter(|row| !row.action.is_empty())
+        .map(|row| {
+            let what = HALVES.iter().find(|(action, _)| *action == row.action).map_or(row.what, |(_, what)| what);
+            Command { what, action: row.action, keys: keys(app, &Row { also: "", ..*row }) }
+        })
+        .collect()
 }
 
 fn column(app: &gtk::Application, sections: &[(&str, &[Row])]) -> gtk::Grid {

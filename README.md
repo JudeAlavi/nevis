@@ -134,6 +134,7 @@ edits, you're asked), and each file reopens where its cursor was.
 
 | Keys | Action |
 |---|---|
+| Ctrl+Shift+P | command palette: every command by name, with its keys; type to narrow, Enter runs it |
 | Ctrl+E | rendered view ⇄ source |
 | Ctrl+T / Ctrl+W / Ctrl+Shift+T | new tab / close tab / reopen closed tab |
 | Ctrl+Tab, Ctrl+Shift+Tab, Alt+1…9 | next / previous / numbered tab (Alt+9: last) |

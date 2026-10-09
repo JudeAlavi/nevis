@@ -19,6 +19,7 @@ mod math;
 mod names;
 mod obsidian;
 mod outline;
+mod palette;
 mod palettes;
 mod picker;
 mod popup;
@@ -158,6 +159,7 @@ fn install_actions(app: &gtk::Application) {
         ("win.sidebar", &["<Ctrl>b"]),
         ("win.open-folder", &["<Ctrl><Shift>o"]),
         ("win.quick-open", &["<Ctrl>p"]),
+        ("win.palette", &["<Ctrl><Shift>p"]),
         ("win.search", &["<Ctrl><Shift>f"]),
     ] {
         app.set_accels_for_action(action, keys);

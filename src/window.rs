@@ -17,6 +17,7 @@ use gtk::{gdk, gio, glib, prelude::*};
 
 use crate::editor::{Editor, OnLoad, alert, choose, spawn, tilde};
 use crate::outline::Outline;
+use crate::palette::Palette;
 use crate::picker::Picker;
 use crate::prefs::SettingsPage;
 use crate::prompt::Prompt;
@@ -68,6 +69,7 @@ pub struct Window {
     prompt: RefCell<Option<Rc<Prompt>>>,
     picker: RefCell<Option<Rc<Picker>>>,
     outline: RefCell<Option<Rc<Outline>>>,
+    palette: RefCell<Option<Rc<Palette>>>,
     settings: RefCell<Option<Rc<SettingsPage>>>,
     help: RefCell<Option<gtk::Widget>>,
     /// Files of tabs closed lately, for Ctrl+Shift+T.
@@ -134,6 +136,7 @@ impl Window {
             prompt: RefCell::new(None),
             picker: RefCell::new(None),
             outline: RefCell::new(None),
+            palette: RefCell::new(None),
             settings: RefCell::new(None),
             help: RefCell::new(None),
             closed: RefCell::new(Vec::new()),
@@ -464,6 +467,7 @@ impl Window {
         self.action("sidebar", |w| w.toggle_sidebar());
         self.action("theme", |w| w.pick_theme());
         self.action("outline", |w| w.toggle_outline());
+        self.action("palette", |w| w.toggle_palette());
         self.action("daily", |w| w.open_daily());
         self.action("link", |w| {
             if let Some(editor) = w.current() {
@@ -890,6 +894,37 @@ impl Window {
         let headings = editor.outline();
         let current = editor.current_heading(&headings);
         outline.show(headings, current);
+    }
+
+    /// The command palette: every command that can run now, to run one by its name.
+    fn toggle_palette(self: &Rc<Self>) {
+        let existing = self.palette.borrow().clone();
+        let palette = match existing {
+            Some(palette) => palette,
+            None => {
+                let window = self.window.downgrade();
+                let palette = Palette::new(move |action| {
+                    if let Some(window) = window.upgrade() {
+                        let _ = WidgetExt::activate_action(&window, action, None);
+                    }
+                });
+                self.add_popup(&palette.widget);
+                *self.palette.borrow_mut() = Some(palette.clone());
+                palette
+            }
+        };
+        if palette.is_open() {
+            return palette.hide();
+        }
+        let Some(app) = self.window.application() else { return };
+        // Those that can run now: an action off (Save with nothing to save, say) isn't offered.
+        let can_run = |action: &str| match action.split_once('.') {
+            Some(("win", name)) => self.window.lookup_action(name).is_some_and(|action| action.is_enabled()),
+            Some(("app", name)) => app.lookup_action(name).is_some_and(|action| action.is_enabled()),
+            _ => false,
+        };
+        let commands = crate::help::commands(&app).into_iter().filter(|command| command.action != "win.palette" && can_run(command.action)).collect();
+        palette.show(commands);
     }
 
     fn pick_theme(self: &Rc<Self>) {
