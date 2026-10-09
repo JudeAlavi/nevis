@@ -222,6 +222,47 @@ pub fn aliases(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The block `^id` names in `text` (an id in code doesn't count): the paragraph it ends, the
+/// list item it ends, or, alone on its line, the block above it. Byte range.
+pub fn block(text: &str, id: &str) -> Option<Range<usize>> {
+    let found = block_ids_outside(text, &code(text)).into_iter().find(|range| text[range.start + 1..range.end] == *id)?;
+    let line = line_around(text, found.start);
+    let words = text[line.clone()].trim_start();
+    // Alone on its line: the block above, past any blank lines.
+    if words.trim_end() == &text[found] {
+        let mut above = line.start;
+        loop {
+            let previous = line_around(text, above.checked_sub(1)?);
+            if !text[previous.clone()].trim().is_empty() {
+                return Some(paragraph_start(text, previous.start)..previous.end);
+            }
+            above = previous.start;
+        }
+    }
+    let ordered = words.split_once(['.', ')']).is_some_and(|(number, rest)| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with(' '));
+    let item = (words.starts_with(['-', '*', '+']) && words[1..].starts_with(' ')) || ordered;
+    if item { Some(line) } else { Some(paragraph_start(text, line.start)..line.end) }
+}
+
+/// The line `at` is on (without its end), as a byte range.
+fn line_around(text: &str, at: usize) -> Range<usize> {
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+    start..end
+}
+
+/// Where the paragraph with its line starting at `line` starts: after the blank line before it.
+fn paragraph_start(text: &str, mut line: usize) -> usize {
+    while line > 0 {
+        let previous = line_around(text, line - 1);
+        if text[previous.clone()].trim().is_empty() {
+            break;
+        }
+        line = previous.start;
+    }
+    line
+}
+
 /// Obsidian's additions in a note, read with its code found once.
 pub struct Additions {
     pub highlights: Vec<Range<usize>>,
@@ -343,6 +384,17 @@ mod tests {
         assert_eq!(aliases("---\nalias: Only one\n---\n"), vec!["Only one"]);
         assert_eq!(aliases("---\naliases:\n  - First\n  - Second\n---\n"), vec!["First", "Second"]);
         assert_eq!(aliases("# Not front matter\naliases: [Nope]\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_block_id_names_its_paragraph_its_list_item_or_the_block_above() {
+        let text = "Intro\n\nFirst line\nsecond line ^para\n\n- one\n- two ^item\n- three\n\n| a |\n|---|\n\n^table\n\n`^code` here\n";
+        let found = |id| block(text, id).map(|range| &text[range]);
+        assert_eq!(found("para"), Some("First line\nsecond line ^para"));
+        assert_eq!(found("item"), Some("- two ^item"));
+        assert_eq!(found("table"), Some("| a |\n|---|"));
+        assert_eq!(found("code"), None);
+        assert_eq!(found("nope"), None);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::session::{self, TabState};
 use crate::window::{How, Window};
 use crate::complete::{self, Completion, Context, Offer};
 use crate::spelling::Spelling;
-use crate::{anchors, attachments, backlinks, daily, devhooks, find::FindBar, links, listing, lists, names, outline, positions, settings, style, switcher, theme, vault};
+use crate::{anchors, attachments, backlinks, daily, devhooks, find::FindBar, links, listing, lists, names, obsidian, outline, positions, settings, style, switcher, theme, vault};
 
 pub struct Editor {
     /// The window the tab is in: dialogs, frames and the title go there.
@@ -58,6 +58,8 @@ pub struct Editor {
     targets: RefCell<Vec<(gtk::TextTag, Target)>>,
     /// The rendered view's headings, for `#heading` links.
     headings: RefCell<Vec<(String, gtk::TextMark)>>,
+    /// Where each block of the note starts in the rendered view, by its line.
+    lines: RefCell<Vec<(usize, gtk::TextMark)>>,
     /// Itself, for work that finishes later (finding backlinks).
     me: Weak<Editor>,
     /// The notes found linking here last: the folder, this note, and each linking note with
@@ -210,6 +212,7 @@ impl Editor {
             note: RefCell::new(None),
             targets: RefCell::new(Vec::new()),
             headings: RefCell::new(Vec::new()),
+            lines: RefCell::new(Vec::new()),
             backlinks: RefCell::new(None),
             backlink_searches: Cell::new(0),
             on_load: RefCell::new(None),
@@ -852,6 +855,7 @@ impl Editor {
         }
         *self.targets.borrow_mut() = rendered.targets;
         *self.headings.borrow_mut() = rendered.headings;
+        *self.lines.borrow_mut() = rendered.lines;
         self.rendered.set(true);
         self.show_backlinks();
         devhooks::lap("markdown rendered");
@@ -1130,8 +1134,24 @@ impl Editor {
     }
 
     /// Scrolls the rendered view to the heading a `#…` link names.
-    /// Goes to the heading `target` names: in either view.
+    /// Goes to the heading `target` names (or the block, for `^id`): in either view.
     fn jump_to_heading(&self, target: &str) {
+        if let Some(id) = target.strip_prefix('^') {
+            let text = self.text();
+            let Some(block) = obsidian::block(&text, id) else { return };
+            let line = text[..block.start].matches('\n').count();
+            if self.is_reading() {
+                let lines = self.lines.borrow();
+                let at = lines.partition_point(|(start, _)| *start <= line);
+                if let Some((_, mark)) = at.checked_sub(1).and_then(|i| lines.get(i)) {
+                    self.reader.scroll_to_mark(mark, 0.0, true, 0.0, 0.0);
+                }
+            } else if let Some(iter) = self.buffer.iter_at_line(line as i32) {
+                self.buffer.place_cursor(&iter);
+                self.view.scroll_to_mark(&self.buffer.get_insert(), 0.0, true, 0.0, 0.1);
+            }
+            return;
+        }
         let headings = outline::headings(&self.text());
         if let Some(index) = headings.iter().position(|heading| anchors::points_at(target, &heading.text)) {
             self.go_to_heading(index, &headings);

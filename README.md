@@ -73,6 +73,8 @@ callouts (`> [!tip] Title`, every kind Obsidian knows and its other names, unkno
 notes) in boxes coloured by kind, folding with `+` or `-` after the kind (click the title);
 `==highlights==`; `#tags` as labels that search for themselves; `![[Note]]` and
 `![[Note#Heading]]` drawing that note, or that part of it, in place (two notes deep at most);
+block references: `[[Note#^id]]` goes to the block a `^id` ends (a paragraph, a list item, or
+the block above an id on its own line) and `![[Note#^id]]` draws just that block;
 front matter as a list of properties; `%%comments%%` and block ids (`^id`) hidden; a task
 ticked with any mark (`[?]`, `[-]`) shown done. Quotes and embedded notes get a bar down their
 side (the right side when they're Persian). It is all plain Markdown underneath, so a README

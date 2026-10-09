@@ -75,6 +75,9 @@ pub struct Rendered {
     pub children: Vec<(gtk::TextChildAnchor, gtk::Widget)>,
     /// Each heading's text and where it starts, for `#heading` links.
     pub headings: Vec<(String, gtk::TextMark)>,
+    /// Where each block starts, by the line of the note it starts on: for going to a line
+    /// (a `#^block` link) in the rendered view.
+    pub lines: Vec<(usize, gtk::TextMark)>,
     /// Fenced code blocks that name a language, to colour with `highlight_code`.
     pub code: Vec<CodeBlock>,
     /// Blocks drawn on panels, outer ones first, for the view to draw behind the text.
@@ -297,6 +300,9 @@ struct Renderer<'m> {
     /// The heading being written: where it starts and its text so far.
     heading: Option<(i32, String)>,
     headings: Vec<(String, gtk::TextMark)>,
+    lines: Vec<(usize, gtk::TextMark)>,
+    /// Where each line of the note starts (bytes), to tell the line a block starts on.
+    line_starts: Vec<usize>,
     /// Image URL and alt text, while inside `![…](…)`.
     image: Option<(String, String)>,
     table: Option<Table>,
@@ -356,6 +362,8 @@ impl<'m> Renderer<'m> {
             code: Vec::new(),
             heading: None,
             headings: Vec::new(),
+            lines: Vec::new(),
+            line_starts: Vec::new(),
             image: None,
             table: None,
             markup_close: Vec::new(),
@@ -379,7 +387,17 @@ impl<'m> Renderer<'m> {
             return;
         }
         match event {
-            Event::Start(tag) => self.start(tag, range),
+            Event::Start(tag) => {
+                let block = matches!(
+                    tag,
+                    Tag::Paragraph | Tag::Heading { .. } | Tag::Item | Tag::CodeBlock(_) | Tag::Table(_) | Tag::BlockQuote(_) | Tag::HtmlBlock
+                );
+                let start = range.start;
+                self.start(tag, range);
+                if block {
+                    self.mark_line(start);
+                }
+            }
             Event::End(tag) => self.end(tag),
             Event::Text(text) => self.text_at(&text, range),
             // U+2068…U+2069 isolate the span: `~/notes/a.md` inside Persian stays in order.
@@ -749,6 +767,7 @@ impl<'m> Renderer<'m> {
     /// The note to draw (comments and block ids blanked) and Obsidian's additions in it.
     fn read(&mut self, shown: &'m str, additions: obsidian::Additions) {
         self.source = shown;
+        self.line_starts = std::iter::once(0).chain(shown.match_indices('\n').map(|(i, _)| i + 1)).collect();
         self.highlights = additions.highlights;
         self.tags = additions.tags;
         self.gone = additions.comments.into_iter().chain(additions.block_ids).collect();
@@ -842,6 +861,19 @@ impl<'m> Renderer<'m> {
         let start = self.buffer.iter_at_offset(start);
         for tag in self.frame.iter().chain(&self.block).chain(&self.inline).chain([tag]) {
             self.buffer.apply_tag(tag, &start, &end);
+        }
+    }
+
+    /// Marks where the block starting at byte `at` of the note starts in the view, by its line
+    /// (the note's own lines only, not an embedded note's).
+    fn mark_line(&mut self, at: usize) {
+        if self.depth > 0 {
+            return;
+        }
+        let line = self.line_starts.partition_point(|&start| start <= at).saturating_sub(1);
+        if self.lines.last().is_none_or(|(last, _)| *last < line) {
+            let mark = self.buffer.create_mark(None, &self.buffer.end_iter(), true);
+            self.lines.push((line, mark));
         }
     }
 
@@ -1244,6 +1276,7 @@ impl<'m> Renderer<'m> {
             targets: self.targets,
             children: self.children,
             headings: self.headings,
+            lines: self.lines,
             code: self.code,
             panels: self.panels,
         }
@@ -1356,6 +1389,10 @@ fn prepare(source: &str) -> (String, obsidian::Additions) {
 /// The part of `text` under `heading` (as a `#heading` link names it): from that heading to
 /// the next one as big or bigger; all of it when there's no such heading.
 fn section(text: &str, heading: &str) -> String {
+    // `#^id`: the block the id names.
+    if let Some(id) = heading.strip_prefix('^') {
+        return obsidian::block(text, id).map_or_else(|| text.to_owned(), |block| text[block].to_owned());
+    }
     let headings = crate::outline::headings(text);
     let Some(at) = headings.iter().position(|h| crate::anchors::points_at(heading, &h.text)) else { return text.to_owned() };
     let level = headings[at].level;
