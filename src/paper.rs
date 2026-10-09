@@ -147,7 +147,11 @@ impl Paper {
 
     /// Draws everything afresh (new colours).
     pub fn forget_drawings(&self) {
-        self.imp().drawings.borrow_mut().clear();
+        for drawing in self.imp().drawings.borrow_mut().drain().filter_map(|(_, drawing)| drawing) {
+            if let Drawing::Embed(_, _, view) = drawing.as_ref() {
+                self.remove(view);
+            }
+        }
         self.imp().applied.borrow_mut().clear();
         self.place_blocks();
     }
@@ -158,10 +162,26 @@ impl Paper {
         imp.size.set(self.pango_context().font_description().map_or(0, |font| font.size()));
         let buffer = self.buffer();
         let room = (self.width() - self.left_margin() - self.right_margin()).max(64) as f32;
+        // Embedded notes no longer asked for, or made at another text size, go, views and all.
+        let size = imp.size.get();
+        let embeds: Vec<String> = imp.wanted.borrow().iter().filter(|(_, block, _)| *block == Block::Embed).map(|(_, _, source)| source.clone()).collect();
+        imp.drawings.borrow_mut().retain(|(block, source, at), drawing| {
+            let keep = *block != Block::Embed || (*at == size && embeds.contains(source));
+            if !keep && let Some(Drawing::Embed(_, _, view)) = drawing.as_deref() {
+                self.remove(view);
+            }
+            keep
+        });
         let mut drawn = Vec::new();
         let mut applied = Vec::new();
         for (range, block, source) in imp.wanted.borrow().iter() {
             let Some(drawing) = self.drawing(*block, source) else { continue };
+            if let Drawing::Embed(_, _, view) = drawing.as_ref() {
+                let width = (room - EMBED_INSET) as i32;
+                if view.width_request() != width {
+                    view.set_size_request(width, -1);
+                }
+            }
             let (first, last) = (buffer.iter_at_offset(range.start as i32), buffer.iter_at_offset(range.end as i32));
             let (top, bottom) = (place(self, &first), place(self, &last));
             let written = bottom.y() + bottom.height() - top.y();
@@ -240,6 +260,47 @@ impl Paper {
                 layout.set_markup(&render::math_markup(latex, false));
                 layout.set_alignment(pango::Alignment::Center);
                 Some(Drawing::Math(layout))
+            }
+            Block::Embed => {
+                let (file, title, text) = render::embedded(source, &find)?;
+                // The note as the rendered view shows it, in a view of its own beside this one's
+                // text, out of sight, painted in place from there.
+                let view = Paper::new();
+                view.add_css_class("nevis-read");
+                view.set_editable(false);
+                view.set_cursor_visible(false);
+                view.set_wrap_mode(gtk::WrapMode::WordChar);
+                view.set_can_focus(false);
+                view.set_can_target(false);
+                self.add_overlay(&view, -100_000, 0);
+                let layout = |text: &str| view.create_pango_layout(Some(text));
+                let rendered = render::render(&text, file.parent().as_ref(), &find, theme::scheme().as_ref(), &layout, 0);
+                view.set_buffer(Some(&rendered.buffer));
+                view.set_panels(rendered.panels);
+                for (anchor, widget) in &rendered.children {
+                    view.add_child_at_anchor(widget, anchor);
+                }
+                render::highlight_code(&rendered.buffer, &rendered.code, theme::scheme().as_ref());
+                let paintable = gtk::WidgetPaintable::new(Some(&view));
+                // Its height known (or changed): room for it again, once laid out.
+                let paper = self.downgrade();
+                paintable.connect_invalidate_size(move |_| {
+                    let paper = paper.clone();
+                    glib::idle_add_local_once(move || {
+                        if let Some(paper) = paper.upgrade() {
+                            paper.place_blocks();
+                        }
+                    });
+                });
+                let paper = self.downgrade();
+                paintable.connect_invalidate_contents(move |_| {
+                    if let Some(paper) = paper.upgrade() {
+                        paper.queue_draw();
+                    }
+                });
+                let name = self.body_layout("");
+                name.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(&title)));
+                Some(Drawing::Embed(name, paintable, view))
             }
             Block::Table => {
                 let table = render::table(source, &find, &text)?;
@@ -327,6 +388,9 @@ const CELL_SIDE: f32 = 10.0;
 const CELL_TOP: f32 = 6.0;
 const COLUMN_GAP: f32 = 18.0;
 const ROW_GAP: f32 = 6.0;
+/// An embedded note's text, in from its bar, and below its name.
+const EMBED_INSET: f32 = 16.0;
+const NAME_GAP: f32 = 6.0;
 
 /// What Live Preview draws for a block (see `style::blocks`).
 pub enum Drawing {
@@ -337,6 +401,8 @@ pub enum Drawing {
     /// A table: its cells' text and where in its column each goes, the columns' widths, the
     /// rows' heights.
     Table(Vec<Vec<(pango::Layout, f32)>>, Vec<f32>, Vec<f32>),
+    /// An embedded note: its name, and the note painted from the view showing it.
+    Embed(pango::Layout, gtk::WidgetPaintable, Paper),
 }
 
 impl Drawing {
@@ -354,6 +420,7 @@ impl Drawing {
                 2.0 + 2.0 * CELL_SIDE + columns.iter().sum::<f32>() + gaps(columns.len(), COLUMN_GAP),
                 2.0 + 2.0 * CELL_TOP + rows.iter().sum::<f32>() + gaps(rows.len(), ROW_GAP),
             ),
+            Drawing::Embed(name, paintable, _) => (room, name.pixel_size().1 as f32 + NAME_GAP + paintable.intrinsic_height() as f32),
         }
     }
 }
@@ -389,6 +456,16 @@ fn draw_blocks(view: &Paper, blocks: &[(Range<usize>, Rc<Drawing>)], snapshot: &
                 snapshot.save();
                 snapshot.translate(&graphene::Point::new((left + (room - width) / 2.0).round(), top));
                 snapshot.append_layout(layout, &render::rgba(colors.text, 1.0));
+                snapshot.restore();
+            }
+            Drawing::Embed(name, paintable, _) => {
+                // A bar down its side and its name, as the rendered view shows an embedded note.
+                snapshot.append_color(&render::rgba(colors.link, 0.9), &graphene::Rect::new(left, top, 3.0, tall));
+                snapshot.save();
+                snapshot.translate(&graphene::Point::new(left + EMBED_INSET, top));
+                snapshot.append_layout(name, &render::rgba(colors.link, 1.0));
+                snapshot.translate(&graphene::Point::new(0.0, name.pixel_size().1 as f32 + NAME_GAP));
+                paintable.snapshot(snapshot, f64::from(room - EMBED_INSET), f64::from(paintable.intrinsic_height()));
                 snapshot.restore();
             }
             Drawing::Table(cells, columns, rows) => {

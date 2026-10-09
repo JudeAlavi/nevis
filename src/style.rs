@@ -13,7 +13,7 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Tag, TagEnd};
 use crate::devhooks;
 use crate::paper::Paper;
 use crate::theme;
-use crate::{obsidian, render};
+use crate::{links, obsidian, render};
 
 /// How a stretch of Markdown source is drawn. Where kinds overlap, the later one wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -747,8 +747,31 @@ pub enum Block {
     Math,
     /// A Mermaid flowchart's fenced block.
     Chart,
-    /// `![…](…)` or `![[…]]`.
+    /// `![…](…)` or `![[…]]` showing a picture.
     Image,
+    /// `![[Note]]` or `![[Note#Heading]]`: the note, or that part of it, shown in place.
+    Embed,
+}
+
+/// Picture endings: what `![…](…)` draws as a picture.
+const PICTURES: [&str; 11] = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico", "tif", "tiff"];
+
+/// What `![…](target)` shows, by its ending: a picture, a note (`.md`, or no ending, as
+/// Obsidian names notes), or nothing Live Preview draws (a PDF, a page on the web).
+fn embedded(target: &str) -> Option<Block> {
+    let path = target.split('#').next().unwrap_or(target);
+    let name = path.rsplit('/').next().unwrap_or(path);
+    // A few letters or digits after the last dot: "v1.2 release" has no ending.
+    let ending = name
+        .rsplit_once('.')
+        .map(|(_, ending)| ending.to_lowercase())
+        .filter(|ending| !ending.is_empty() && ending.len() <= 5 && ending.chars().all(|c| c.is_ascii_alphanumeric()));
+    match ending.as_deref() {
+        Some(ending) if PICTURES.contains(&ending) => Some(Block::Image),
+        _ if links::has_scheme(target) => None,
+        Some("md") | None => Some(Block::Embed),
+        Some(_) => None,
+    }
 }
 
 /// Something Live Preview draws (see `drawn`).
@@ -812,8 +835,10 @@ pub fn spans(source: &str) -> Spans {
             });
         }
         match event {
-            Event::Start(Tag::Image { .. }) => {
-                out.block(source, range.clone(), Block::Image);
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                if let Some(block) = embedded(&dest_url) {
+                    out.block(source, range.clone(), block);
+                }
                 links.push((range, None));
             }
             Event::Start(Tag::Link { .. }) => links.push((range, None)),
@@ -1298,6 +1323,22 @@ mod tests {
         );
         // With the cursor in it, the table is written out.
         assert_eq!(drawn(3..=3).len(), 3);
+    }
+
+    #[test]
+    fn live_preview_draws_an_embedded_note_but_not_other_files() {
+        let text = "![[Other note]]\n\n![[Plans#Budget|the budget]]\n\n![](Notes/Other.md)\n\n![[paper.pdf]]\n\n![[v1.2 release]]\n\n![](https://example.com/page)\n";
+        let s = spans(text);
+        let drawn: Vec<_> = blocks(text, &s, 99..=99).into_iter().map(|(range, block)| (&text[range], block)).collect();
+        assert_eq!(
+            drawn,
+            vec![
+                ("![[Other note]]", Block::Embed),
+                ("![[Plans#Budget|the budget]]", Block::Embed),
+                ("![](Notes/Other.md)", Block::Embed),
+                ("![[v1.2 release]]", Block::Embed),
+            ]
+        );
     }
 
     #[test]

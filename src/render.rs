@@ -1417,6 +1417,28 @@ pub fn picture(source: &str, find: &dyn Fn(&str) -> Option<gio::File>) -> Option
     Some((texture, width, height))
 }
 
+/// The note `source` (`![[Note]]`, `![[Note#Heading]]`, `![](Note.md)`) embeds, found as the
+/// rendered view finds it: its file, its title (its name, and the heading) and its text (that
+/// part of it). For Live Preview; nothing when it isn't a note there.
+pub fn embedded(source: &str, find: &dyn Fn(&str) -> Option<gio::File>) -> Option<(gio::File, String, String)> {
+    let url = events(source).find_map(|(event, _)| match event {
+        Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.to_string()),
+        _ => None,
+    })?;
+    let target = links::split(&url);
+    let path = links::decode(&target.path);
+    let note = |file: &gio::File| file.basename().is_some_and(|name| name.to_string_lossy().to_lowercase().ends_with(".md"));
+    let file = find(&path).filter(note)?;
+    let (bytes, _) = file.load_contents(None::<&gio::Cancellable>).ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let name = path.rsplit('/').next().unwrap_or(&path);
+    let name = name.strip_suffix(".md").unwrap_or(name).to_owned();
+    Some(match &target.heading {
+        Some(heading) => (file, format!("{name} \u{203A} {heading}"), section(&text, heading)),
+        None => (file, name, text),
+    })
+}
+
 /// The table `source` is, its cells as the rendered view writes them: for Live Preview.
 pub fn table(source: &str, find: &dyn Fn(&str) -> Option<gio::File>, text: &dyn Fn(&str) -> pango::Layout) -> Option<Table> {
     let mut r = Renderer::new(None, find, sourceview::Buffer::new(None), text, 0);
