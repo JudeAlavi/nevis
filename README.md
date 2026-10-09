@@ -7,20 +7,14 @@ I wanted something to edit text without opening a heavy application like VS Code
 
 ## Features
 
-- **Fast**: a note is on screen in about 130 ms on a 2019 laptop, as a small background
-  service keeps nevis ready.
-- **Nothing lost**: tabs come back as you left them, unsaved text included; a crash loses at
-  most the last second of typing.
-- **Markdown, as in Obsidian**: a rendered view and Live Preview editing, with `[[links]]`,
-  callouts, tags, embedded notes, backlinks and daily notes, in any folder or Obsidian vault.
-- **Math and diagrams**: formulas (`$…$`) and Mermaid flowcharts, sequence, state and class
-  diagrams and Gantt charts, drawn in the note.
-- **Folders**: a sidebar, Ctrl+P to jump to any note, heading or tag, and a search through
-  every note.
-- **Persian and other right-to-left text**, mixed freely with English.
-- **Code**: syntax highlighting for every language GtkSourceView knows.
-- **Themes**: your GTK theme's colours (matugen, noctalia, pywal), followed live, or a built-in
-  one such as Catppuccin, Gruvbox or Tokyo Night.
+- Tabs, with unsaved notes kept
+- Markdown with Live Preview, as in Obsidian
+- `[[links]]`, callouts, tags, embeds, backlinks
+- Math and Mermaid diagrams
+- Folder sidebar, quick open, search
+- Persian and right-to-left text
+- Syntax highlighting
+- Themes following your GTK colours
 
 ## Build and install
 
