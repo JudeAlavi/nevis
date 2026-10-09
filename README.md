@@ -49,9 +49,11 @@ without `>`, block ids (`^id`) gone, code blocks without their fences while the 
 outside them. In place of their markup it draws a dot for each `-`, a checkbox for each
 `[ ]` (click it to tick it; the cursor stays where it is), a line for a rule and a callout's
 title in its colour; quotes get a bar beside them and callouts a box behind them. Ticked
-tasks are struck through. Tables, pictures, formulas (`$$…$$`) and Mermaid flowcharts on
-lines of their own are drawn as in the rendered view, over their lines, until the cursor goes
-into them. Inline math, HTML and front matter stay as written. Settings → Edit Markdown as → Source shows all of it, styled.
+tasks are struck through. Tables, pictures, formulas (`$$…$$`), Mermaid flowcharts and
+embedded notes (`![[Note]]`) on lines of their own are drawn as in the rendered view, over
+their lines, until the cursor goes into them; a picture in a sentence or a list item is drawn
+under its line. Inline math, HTML and front matter stay as written. Settings → Edit Markdown
+as → Source shows all of it, styled.
 
 **Links, as in Obsidian.** A `[[link]]` or a relative link opens the note beside this one if
 there is one, and otherwise the note of that name anywhere in the vault (the folder holding

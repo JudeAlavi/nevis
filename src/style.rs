@@ -204,18 +204,27 @@ impl Styler {
         }
         let editing = self.editing_lines();
         self.editing.set(editing);
-        let (want, marks, blocks) = match (&*self.styled.borrow(), editing) {
+        let (want, marks, blocks, rows) = match (&*self.styled.borrow(), editing) {
             (Some((text, spans)), Some((first, last))) if self.live.get() && self.enabled.get() => {
-                let blocks = blocks(text, spans, first..=last);
-                // Each block's source, for the paper to draw it from.
-                let bytes: Vec<usize> = if blocks.is_empty() { Vec::new() } else { text.char_indices().map(|(i, _)| i).chain([text.len()]).collect() };
-                let blocks = blocks.into_iter().map(|(range, block)| {
-                    let source = text[bytes[range.start]..bytes[range.end]].to_owned();
-                    (range, block, source)
-                });
-                (hidden(text, spans, first..=last), drawn(text, spans, first..=last), blocks.collect())
+                let (blocks, rows) = (blocks(text, spans, first..=last), pictures(text, spans, first..=last));
+                // Each block's and picture's source, for the paper to draw it from.
+                let bytes: Vec<usize> = if blocks.is_empty() && rows.is_empty() {
+                    Vec::new()
+                } else {
+                    text.char_indices().map(|(i, _)| i).chain([text.len()]).collect()
+                };
+                let source = |range: &Range<usize>| text[bytes[range.start]..bytes[range.end]].to_owned();
+                let blocks = blocks
+                    .into_iter()
+                    .map(|(range, block)| {
+                        let text = source(&range);
+                        (range, block, text)
+                    })
+                    .collect();
+                let rows = rows.into_iter().map(|(line, pictures)| (line, pictures.iter().map(source).collect())).collect();
+                (hidden(text, spans, first..=last), drawn(text, spans, first..=last), blocks, rows)
             }
-            _ => (Vec::new(), Vec::new(), Vec::new()),
+            _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
         self.retag(&self.hide, &want);
         // Under a drawing the text stays, unseen (a title's line is hidden instead).
@@ -223,7 +232,7 @@ impl Styler {
         self.retag(&self.clear, &under);
         if let Some(paper) = &*self.paper.borrow() {
             paper.set_marks(marks);
-            paper.set_blocks(blocks);
+            paper.set_blocks(blocks, rows);
         }
     }
 
@@ -575,7 +584,7 @@ fn subtract(a: &[Range<usize>], b: &[Range<usize>]) -> Vec<Range<usize>> {
 /// that name a language, to colour as that language.
 #[derive(Debug, Default)]
 #[derive(Clone)]
-pub struct Spans([Vec<Range<usize>>; KINDS], Vec<Fence>, Vec<Range<usize>>, Vec<(Range<usize>, Block)>);
+pub struct Spans([Vec<Range<usize>>; KINDS], Vec<Fence>, Vec<Range<usize>>, Vec<(Range<usize>, Block)>, Vec<Range<usize>>);
 
 /// A fenced code block's language, and the character ranges its code is in: one, or a piece
 /// per line inside a quote or a list (their markers aren't code).
@@ -739,6 +748,31 @@ pub fn blocks(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<usi
     spans.3.iter().filter(|(range, _)| !overlap(range, &edited)).cloned().collect()
 }
 
+/// The pictures in lines that have other things in them too (a sentence, a list item), away
+/// from the lines `editing`: Live Preview draws them under their line. Each line (whole,
+/// without its end) with its pictures' markup; character ranges.
+pub fn pictures(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<usize>) -> Vec<(Range<usize>, Vec<Range<usize>>)> {
+    let chars: Vec<char> = source.chars().collect();
+    let edited = lines(&chars, &editing);
+    let mut found: Vec<(Range<usize>, Vec<Range<usize>>)> = Vec::new();
+    for picture in &spans.4 {
+        // A table draws its own.
+        if spans.3.iter().any(|(block, _)| overlap(block, picture)) {
+            continue;
+        }
+        let start = chars[..picture.start].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+        let end = chars[picture.end..].iter().position(|&c| c == '\n').map_or(chars.len(), |i| picture.end + i);
+        if overlap(&(start..end), &edited) {
+            continue;
+        }
+        match found.last_mut() {
+            Some((line, pictures)) if *line == (start..end) => pictures.push(picture.clone()),
+            _ => found.push((start..end, vec![picture.clone()])),
+        }
+    }
+    found
+}
+
 /// A block Live Preview may draw (see `blocks`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Block {
@@ -823,6 +857,7 @@ pub fn spans(source: &str) -> Spans {
         }
         if let Event::End(TagEnd::Link | TagEnd::Image) = event {
             if let Some((link, label)) = links.pop() {
+                let label = picture_label(source, &link, label);
                 link_parts(link, label, &mut out);
             }
             continue;
@@ -836,8 +871,11 @@ pub fn spans(source: &str) -> Spans {
         }
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => {
-                if let Some(block) = embedded(&dest_url) {
-                    out.block(source, range.clone(), block);
+                let block = embedded(&dest_url);
+                let alone = block.is_some_and(|block| out.block(source, range.clone(), block));
+                // A picture beside other things is drawn under its line (one on the web isn't).
+                if block == Some(Block::Image) && !alone && !links::has_scheme(&dest_url) {
+                    out.pictures.push(range.clone());
                 }
                 links.push((range, None));
             }
@@ -974,6 +1012,22 @@ fn list_marker(source: &str, item: Range<usize>, out: &mut Collector) {
     out.push(Kind::ListMarker, start..start + len);
 }
 
+/// A link's label, but for `![[pic.png|300]]`: there the size after `|` comes as the label,
+/// and the picture's name is what reads as words.
+fn picture_label(source: &str, link: &Range<usize>, label: Option<Range<usize>>) -> Option<Range<usize>> {
+    let is_size = |text: &str| {
+        let (width, height) = text.split_once('x').unwrap_or((text, "1"));
+        [width, height].iter().all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let text = &source[link.clone()];
+    match text.find('|') {
+        Some(bar) if text.starts_with("![[") && label.as_ref().is_some_and(|label| is_size(&source[label.clone()])) => {
+            Some(link.start + 3..link.start + bar)
+        }
+        _ => label,
+    }
+}
+
 /// "[label](url)": the label as a link, what comes before it dimmed, the rest as the URL.
 fn link_parts(link: Range<usize>, label: Option<Range<usize>>, out: &mut Collector) {
     match label {
@@ -1062,6 +1116,8 @@ struct Collector {
     written: Vec<Range<usize>>,
     /// Blocks Live Preview may draw: whole lines (byte ranges).
     blocks: Vec<(Range<usize>, Block)>,
+    /// Pictures sharing their line with other things (byte ranges).
+    pictures: Vec<Range<usize>>,
 }
 
 impl Collector {
@@ -1075,15 +1131,17 @@ impl Collector {
         self.written.push(range);
     }
 
-    /// `range` as a block Live Preview may draw, if it has its lines to itself: nothing
-    /// beside it, not in a quote or a list.
-    fn block(&mut self, source: &str, range: Range<usize>, kind: Block) {
+    /// `range` as a block Live Preview may draw, if it has its lines to itself (nothing
+    /// beside it, not in a quote or a list): whether it does.
+    fn block(&mut self, source: &str, range: Range<usize>, kind: Block) -> bool {
         let range = without_newline(source, range);
         let start = source[..range.start].rfind('\n').map_or(0, |i| i + 1);
         let end = source[range.end..].find('\n').map_or(source.len(), |i| range.end + i);
-        if source[start..range.start].trim().is_empty() && source[range.end..end].trim().is_empty() {
+        let alone = source[start..range.start].trim().is_empty() && source[range.end..end].trim().is_empty();
+        if alone {
             self.blocks.push((start..end, kind));
         }
+        alone
     }
 
     /// Character ranges, sorted, with overlapping or touching ones merged.
@@ -1109,7 +1167,8 @@ impl Collector {
         });
         let written = self.written.into_iter().map(|r| char_at(r.start)..char_at(r.end)).collect();
         let blocks = self.blocks.into_iter().map(|(r, block)| (char_at(r.start)..char_at(r.end), block)).collect();
-        Spans(ranges, fences, written, blocks)
+        let pictures = self.pictures.into_iter().map(|r| char_at(r.start)..char_at(r.end)).collect();
+        Spans(ranges, fences, written, blocks, pictures)
     }
 }
 
@@ -1339,6 +1398,34 @@ mod tests {
                 ("![[v1.2 release]]", Block::Embed),
             ]
         );
+    }
+
+    #[test]
+    fn live_preview_draws_pictures_in_a_line_under_it() {
+        let text = "Text ![a](one.png) and ![[two.jpg|40]] here.\n- ![b](three.png)\n![alone](four.png)\n\n| ![c](cell.png) |\n|---|\n\nSee ![x](https://example.com/p.png) and ![[Note]].\n";
+        let s = spans(text);
+        let found = |editing| {
+            pictures(text, &s, editing)
+                .into_iter()
+                .map(|(line, pictures)| (&text[line], pictures.into_iter().map(|p| &text[p]).collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            found(99..=99),
+            vec![
+                ("Text ![a](one.png) and ![[two.jpg|40]] here.", vec!["![a](one.png)", "![[two.jpg|40]]"]),
+                ("- ![b](three.png)", vec!["![b](three.png)"]),
+            ]
+        );
+        // The line being edited shows its markup instead.
+        assert_eq!(found(0..=0).len(), 1);
+    }
+
+    #[test]
+    fn a_wikilink_pictures_size_is_markup_and_its_name_the_words() {
+        let s = spans("![[pic.png|300]] ![[shot.png|300x200]] ![[Note|alias]]");
+        assert_eq!(s.of(Kind::LinkText), &[3..10, 20..28, 47..52]);
+        assert_eq!(s.of(Kind::Url), &[10..16, 28..38, 52..54]);
     }
 
     #[test]

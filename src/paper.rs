@@ -26,6 +26,9 @@ type Finder = Box<dyn Fn(&str) -> Option<gio::File>>;
 /// Drawings by a block's kind, source and the text size (none where it can't be drawn).
 type Drawings = HashMap<(Block, String, i32), Option<Rc<Drawing>>>;
 
+/// A row of pictures under a line: the line, the pictures, and the room kept for them.
+type Row = (Range<usize>, Vec<Rc<Drawing>>, i32);
+
 mod imp {
     use super::*;
 
@@ -37,10 +40,15 @@ mod imp {
         /// room kept above the first line of those taller drawn than written.
         pub wanted: RefCell<Vec<(Range<usize>, Block, String)>>,
         pub blocks: RefCell<Vec<(Range<usize>, Rc<Drawing>)>>,
-        pub applied: RefCell<Vec<(Range<usize>, i32)>>,
+        /// Pictures beside other things: those asked for (their line, their sources), and those
+        /// drawn in a row under it, with the room kept for them.
+        pub wanted_rows: RefCell<Vec<(Range<usize>, Vec<String>)>>,
+        pub rows: RefCell<Vec<Row>>,
+        /// The room tags keep now: where, how much, and whether under the line.
+        pub applied: RefCell<Vec<(Range<usize>, i32, bool)>>,
         pub drawings: RefCell<Drawings>,
-        /// Tags keeping room above a line, by height.
-        pub rooms: RefCell<HashMap<i32, gtk::TextTag>>,
+        /// Tags keeping room above a line or under it, by which and how much.
+        pub rooms: RefCell<HashMap<(bool, i32), gtk::TextTag>>,
         pub finder: RefCell<Option<Finder>>,
         /// Callout titles as Pango markup, by their Markdown.
         pub titles: RefCell<HashMap<String, String>>,
@@ -63,7 +71,7 @@ mod imp {
         fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
             self.parent_size_allocate(width, height, baseline);
             // Drawn blocks fit the new width (pictures shrink): their room again, once allocated.
-            if self.width.replace(width) != width && !self.wanted.borrow().is_empty() {
+            if self.width.replace(width) != width && self.obj().has_blocks() {
                 let paper = self.obj().downgrade();
                 glib::idle_add_local_once(move || {
                     if let Some(paper) = paper.upgrade() {
@@ -81,11 +89,11 @@ mod imp {
             }
             self.parent_snapshot_layer(layer, snapshot.clone());
             if layer == gtk::TextViewLayer::AboveText {
-                super::draw_blocks(&self.obj(), &self.blocks.borrow(), &snapshot);
+                super::draw_blocks(&self.obj(), &self.blocks.borrow(), &self.rows.borrow(), &snapshot);
                 super::draw_marks(&self.obj(), &self.marks.borrow(), &snapshot);
                 // The text size changed: blocks drawn again at the new size, once this is drawn.
                 let size = self.obj().pango_context().font_description().map_or(0, |font| font.size());
-                if size != self.size.get() && !self.wanted.borrow().is_empty() {
+                if size != self.size.get() && self.obj().has_blocks() {
                     self.size.set(size);
                     let paper = self.obj().downgrade();
                     glib::idle_add_local_once(move || {
@@ -139,10 +147,16 @@ impl Paper {
     }
 
     /// Draws `blocks` (whole lines, sorted characters of the buffer shown now; see
-    /// `style::blocks`) over their lines: those it can draw.
-    pub fn set_blocks(&self, blocks: Vec<(Range<usize>, Block, String)>) {
+    /// `style::blocks`) over their lines, and the pictures in `rows` (each line with its
+    /// pictures' sources; see `style::pictures`) under their line: those it can draw.
+    pub fn set_blocks(&self, blocks: Vec<(Range<usize>, Block, String)>, rows: Vec<(Range<usize>, Vec<String>)>) {
         *self.imp().wanted.borrow_mut() = blocks;
+        *self.imp().wanted_rows.borrow_mut() = rows;
         self.place_blocks();
+    }
+
+    fn has_blocks(&self) -> bool {
+        !self.imp().wanted.borrow().is_empty() || !self.imp().wanted_rows.borrow().is_empty()
     }
 
     /// Draws everything afresh (new colours).
@@ -186,25 +200,39 @@ impl Paper {
             let (top, bottom) = (place(self, &first), place(self, &last));
             let written = bottom.y() + bottom.height() - top.y();
             let keep = (drawing.size(room).1.ceil() as i32 + ABOVE + BELOW - written).max(0);
-            applied.push((range.clone(), keep));
+            applied.push((range.clone(), keep, false));
             drawn.push((range.clone(), drawing));
+        }
+        let mut rows = Vec::new();
+        for (line, sources) in imp.wanted_rows.borrow().iter() {
+            let pictures: Vec<Rc<Drawing>> = sources.iter().filter_map(|source| self.drawing(Block::Image, source)).collect();
+            if pictures.is_empty() {
+                continue;
+            }
+            let tall = row(&pictures, room).iter().map(|(_, tall)| *tall).fold(0.0, f32::max);
+            let keep = tall.ceil() as i32 + ABOVE + BELOW;
+            applied.push((line.clone(), keep, true));
+            rows.push((line.clone(), pictures, keep));
         }
         if *imp.applied.borrow() != applied {
             let (start, end) = buffer.bounds();
             for tag in imp.rooms.borrow().values() {
                 buffer.remove_tag(tag, &start, &end);
             }
-            for (range, keep) in applied.iter().filter(|(_, keep)| *keep > 0) {
+            for &(ref range, keep, under) in applied.iter().filter(|(_, keep, _)| *keep > 0) {
                 let first = buffer.iter_at_offset(range.start as i32);
                 let mut next = first;
                 next.forward_line();
-                let keep = *keep;
                 let tag = imp
                     .rooms
                     .borrow_mut()
-                    .entry(keep)
+                    .entry((under, keep))
                     .or_insert_with(|| {
-                        let tag = gtk::TextTag::builder().pixels_above_lines(keep).build();
+                        let tag = if under {
+                            gtk::TextTag::builder().pixels_below_lines(keep).build()
+                        } else {
+                            gtk::TextTag::builder().pixels_above_lines(keep).build()
+                        };
                         buffer.tag_table().add(&tag);
                         tag
                     })
@@ -214,6 +242,7 @@ impl Paper {
             *imp.applied.borrow_mut() = applied;
         }
         *imp.blocks.borrow_mut() = drawn;
+        *imp.rows.borrow_mut() = rows;
         self.queue_draw();
     }
 
@@ -391,6 +420,17 @@ const ROW_GAP: f32 = 6.0;
 /// An embedded note's text, in from its bar, and below its name.
 const EMBED_INSET: f32 = 16.0;
 const NAME_GAP: f32 = 6.0;
+/// Between pictures in a row under their line.
+const PICTURE_GAP: f32 = 8.0;
+
+/// The size of each of `pictures` in a row at most `room` wide: shrunk alike to fit.
+fn row(pictures: &[Rc<Drawing>], room: f32) -> Vec<(f32, f32)> {
+    let sizes: Vec<(f32, f32)> = pictures.iter().map(|picture| picture.size(room)).collect();
+    let gaps = PICTURE_GAP * sizes.len().saturating_sub(1) as f32;
+    let wide = sizes.iter().map(|(width, _)| width).sum::<f32>();
+    let shrink = if wide + gaps > room { ((room - gaps) / wide).max(0.05) } else { 1.0 };
+    sizes.into_iter().map(|(width, tall)| (width * shrink, tall * shrink)).collect()
+}
 
 /// What Live Preview draws for a block (see `style::blocks`).
 pub enum Drawing {
@@ -426,13 +466,30 @@ impl Drawing {
 }
 
 /// `blocks` over their lines (and the room above them), those on screen: the lines covered in
-/// the page's colour, the drawing in the middle.
-fn draw_blocks(view: &Paper, blocks: &[(Range<usize>, Rc<Drawing>)], snapshot: &gtk::Snapshot) {
+/// the page's colour, the drawing in the middle. And `rows` of pictures under their lines.
+fn draw_blocks(view: &Paper, blocks: &[(Range<usize>, Rc<Drawing>)], rows: &[Row], snapshot: &gtk::Snapshot) {
     let buffer = view.buffer();
     let seen = view.visible_rect();
     let left = view.left_margin() as f32;
     let room = (seen.width() - view.left_margin() - view.right_margin()) as f32;
     let colors = theme::colors();
+    for (line, pictures, keep) in rows {
+        let (y, height) = view.line_yrange(&buffer.iter_at_offset(line.start as i32));
+        if y > seen.y() + seen.height() || y + height < seen.y() {
+            continue;
+        }
+        let top = (y + height - keep + ABOVE) as f32;
+        let mut x = left;
+        for (picture, (width, tall)) in pictures.iter().zip(row(pictures, room)) {
+            if let Drawing::Picture(paintable, ..) = picture.as_ref() {
+                snapshot.save();
+                snapshot.translate(&graphene::Point::new(x.round(), top));
+                paintable.snapshot(snapshot, f64::from(width), f64::from(tall));
+                snapshot.restore();
+            }
+            x += width + PICTURE_GAP;
+        }
+    }
     for (range, drawing) in blocks {
         let (y, _) = view.line_yrange(&buffer.iter_at_offset(range.start as i32));
         let (last, last_height) = view.line_yrange(&buffer.iter_at_offset(range.end as i32));
