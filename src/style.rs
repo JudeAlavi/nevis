@@ -11,8 +11,8 @@ use gtk::{gdk, glib, pango, prelude::*};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Tag, TagEnd};
 
 use crate::devhooks;
-use crate::render;
 use crate::theme;
+use crate::{obsidian, render};
 
 /// How a stretch of Markdown source is drawn. Where kinds overlap, the later one wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,11 +30,14 @@ pub enum Kind {
     Strong,
     Emphasis,
     Strike,
+    Highlight,
     Code,
     LinkText,
+    Tag,
     ListMarker,
     Task,
     Url,
+    Comment,
     Marker,
 }
 
@@ -55,11 +58,14 @@ const ALL: [Kind; KINDS] = [
     Kind::Strong,
     Kind::Emphasis,
     Kind::Strike,
+    Kind::Highlight,
     Kind::Code,
     Kind::LinkText,
+    Kind::Tag,
     Kind::ListMarker,
     Kind::Task,
     Kind::Url,
+    Kind::Comment,
     Kind::Marker,
 ];
 
@@ -380,7 +386,14 @@ impl Styler {
 /// How each kind looks: Ayu Mirage colours, sizes for headings.
 fn tag_for(kind: Kind) -> gtk::TextTag {
     let heading = |scale: f64| gtk::TextTag::builder().weight(700).scale(scale).foreground(theme::colors().heading.to_hex()).build();
+    let tint = |color: crate::color::Rgb, alpha: f32| gdk::RGBA::new(color.r as f32, color.g as f32, color.b as f32, alpha);
     match kind {
+        Kind::Highlight => gtk::TextTag::builder().background_rgba(&tint(theme::colors().changed, 0.32)).build(),
+        Kind::Tag => gtk::TextTag::builder()
+            .foreground(theme::colors().accent.to_hex())
+            .background_rgba(&tint(theme::colors().accent, 0.14))
+            .build(),
+        Kind::Comment => gtk::TextTag::builder().foreground(theme::colors().dim.to_hex()).style(pango::Style::Italic).build(),
         Kind::Quote => gtk::TextTag::builder().foreground(theme::colors().quote.to_hex()).style(pango::Style::Italic).build(),
         Kind::CodeBlock => gtk::TextTag::builder()
             .foreground(theme::colors().code.to_hex())
@@ -409,7 +422,7 @@ fn tag_for(kind: Kind) -> gtk::TextTag {
 /// written-out ones, front matter, HTML and Arabic-script words; character ranges, sorted and
 /// merged.
 fn unspelled(text: &str, spans: &Spans) -> Vec<Range<usize>> {
-    let mut ranges: Vec<Range<usize>> = [Kind::Code, Kind::CodeBlock, Kind::Url, Kind::Frontmatter, Kind::Html]
+    let mut ranges: Vec<Range<usize>> = [Kind::Code, Kind::CodeBlock, Kind::Url, Kind::Frontmatter, Kind::Html, Kind::Tag]
         .iter()
         .flat_map(|&kind| spans.of(kind).iter().cloned())
         .collect();
@@ -573,7 +586,12 @@ pub fn spans(source: &str) -> Spans {
     let mut links: Vec<(Range<usize>, Option<Range<usize>>)> = Vec::new();
     // The fenced code block being read, if it names a language, and its code so far.
     let mut fence: Option<(String, Vec<Range<usize>>)> = None;
+    // Code and math, where Obsidian's additions don't count.
+    let mut code: Vec<Range<usize>> = Vec::new();
     for (event, range) in render::events(source) {
+        if let Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) | Event::Start(Tag::CodeBlock(_)) = &event {
+            code.push(range.clone());
+        }
         match &event {
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
                 // "rust", "py title", "rust,ignore", "{.python}".
@@ -645,6 +663,23 @@ pub fn spans(source: &str) -> Spans {
             Event::TaskListMarker(_) => out.push(Kind::Task, range),
             _ => {}
         }
+    }
+    // Obsidian's additions: highlights (their == dimmed, hidden in Live Preview like other
+    // markup), tags, comments, and block ids (dimmed and hidden like markup).
+    let additions = obsidian::additions_in(source, &code);
+    for range in additions.highlights {
+        out.push(Kind::Marker, range.start..range.start + 2);
+        out.push(Kind::Marker, range.end - 2..range.end);
+        out.push(Kind::Highlight, range);
+    }
+    for range in additions.tags {
+        out.push(Kind::Tag, range);
+    }
+    for range in additions.comments {
+        out.push(Kind::Comment, range);
+    }
+    for range in additions.block_ids {
+        out.push(Kind::Marker, range);
     }
     out.into_spans(source)
 }

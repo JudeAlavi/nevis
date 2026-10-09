@@ -7,7 +7,7 @@ use gtk::{gdk, gio, glib, pango, prelude::*};
 use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use sourceview::prelude::*;
 
-use crate::{flowchart, links, math};
+use crate::{flowchart, links, math, obsidian, settings};
 use crate::theme::{self, fonts};
 
 /// What a click on the rendered text does.
@@ -19,6 +19,10 @@ pub enum Target {
     Task(Range<usize>),
     /// A note, by its file (the notes linking here, under the rendered note).
     File(gio::File),
+    /// A tag (`#travel`): clicking searches for it.
+    Tag(String),
+    /// A foldable callout's header: clicking shows or hides the body this tag hides.
+    Fold(gtk::TextTag),
 }
 
 /// Markdown features nevis understands, shared by the read view and the source styling.
@@ -73,6 +77,39 @@ pub struct Rendered {
     pub headings: Vec<(String, gtk::TextMark)>,
     /// Fenced code blocks that name a language, to colour with `highlight_code`.
     pub code: Vec<CodeBlock>,
+    /// Blocks drawn on panels, outer ones first, for the view to draw behind the text.
+    pub panels: Vec<Panel>,
+}
+
+/// A block drawn on a panel behind its text (by `reader::Reader`): from `start`'s line to
+/// `end`'s, `inset` pixels in from the view's sides.
+pub struct Panel {
+    pub start: gtk::TextMark,
+    pub end: gtk::TextMark,
+    pub inset: i32,
+    pub look: Look,
+    /// Right-to-left: a bar goes down the right side.
+    pub rtl: bool,
+    /// A foldable callout's: the tag hiding its body, and where the body starts.
+    pub fold: Option<(gtk::TextTag, gtk::TextMark)>,
+}
+
+pub enum Look {
+    /// A box filled with this colour: a callout.
+    Box(gdk::RGBA),
+    /// A bar in this colour down its side: a quote, an embedded note.
+    Bar(gdk::RGBA),
+}
+
+/// A block open on a panel, and what to go back to at its end.
+struct Open {
+    panel: usize,
+    blocks: usize,
+    left: i32,
+    list_base: usize,
+    frame: Option<gtk::TextTag>,
+    /// A foldable callout: where its body starts and the tag that hides it.
+    fold: Option<(i32, gtk::TextTag)>,
 }
 
 pub struct CodeBlock {
@@ -96,8 +133,10 @@ pub fn render(
     let buffer = sourceview::Buffer::new(None);
     buffer.set_style_scheme(scheme);
     buffer.set_highlight_syntax(false);
+    let (shown, additions) = prepare(source);
     let mut r = Renderer::new(folder, find, buffer, text, margin);
-    for (event, range) in events(source) {
+    r.read(&shown, additions);
+    for (event, range) in events(&shown) {
         r.event(event, range);
     }
     r.finish()
@@ -114,7 +153,7 @@ struct Styles {
     code_top: gtk::TextTag,
     code_bottom: gtk::TextTag,
     quote: gtk::TextTag,
-    callout: gtk::TextTag,
+    highlight: gtk::TextTag,
     done: gtk::TextTag,
     dim: gtk::TextTag,
     rule: gtk::TextTag,
@@ -157,15 +196,11 @@ impl Styles {
                 .build()),
             code_top: add(gtk::TextTag::builder().pixels_above_lines(8).build()),
             code_bottom: add(gtk::TextTag::builder().pixels_below_lines(14).build()),
-            quote: add(gtk::TextTag::builder()
-                .paragraph_background(theme::colors().quote_background.to_hex())
-                .foreground(theme::colors().quote.to_hex())
-                .left_margin(margin + 14)
-                .right_margin(margin + 14)
-                .pixels_above_lines(2)
-                .pixels_below_lines(2)
-                .build()),
-            callout: add(gtk::TextTag::builder().weight(700).foreground(theme::colors().accent.to_hex()).build()),
+            quote: add(gtk::TextTag::builder().foreground(theme::colors().quote.to_hex()).build()),
+            highlight: add(gtk::TextTag::builder().background_rgba(&{
+                let c = theme::colors().changed;
+                gdk::RGBA::new(c.r as f32, c.g as f32, c.b as f32, 0.32)
+            }).build()),
             done: add(gtk::TextTag::builder().strikethrough(true).foreground(theme::colors().dim.to_hex()).build()),
             dim: add(gtk::TextTag::builder().foreground(theme::colors().dim.to_hex()).build()),
             rule: add(gtk::TextTag::builder().size_points(1.0).paragraph_background(theme::colors().rule.to_hex()).build()),
@@ -205,6 +240,34 @@ struct Renderer<'m> {
     folder: Option<gio::File>,
     /// The file a link or embed names, if there is one.
     find: &'m dyn Fn(&str) -> Option<gio::File>,
+    /// The note as parsed (comments and block ids blanked), and Obsidian's highlights and tags
+    /// in it, as byte ranges.
+    source: &'m str,
+    highlights: Vec<Range<usize>>,
+    tags: Vec<Range<usize>>,
+    /// What was blanked (comments, block ids): left out, with a space next to it.
+    gone: Vec<Range<usize>>,
+    /// Text before this byte was drawn already (a task's own mark, `[?]`).
+    drawn_to: usize,
+    /// How many embedded notes deep this is (`![[Note]]` in a note: 1).
+    depth: u8,
+    /// Blocks drawn on panels (see `Panel`), outer ones first, and those open now.
+    panels: Vec<Panel>,
+    open: Vec<Open>,
+    /// Where text starts, from both sides of the view: the margin, further in on panels.
+    left: i32,
+    /// Lists outside the innermost panel's block: list depth counts from there.
+    list_base: usize,
+    /// The innermost panel's margins, under every other tag (lists, code keep their own).
+    frame: Option<gtk::TextTag>,
+    /// Those margins, by `left`.
+    frames: HashMap<i32, gtk::TextTag>,
+    /// A callout's first line (`[!kind] Title`), drawn as its header instead.
+    skipping: bool,
+    /// Front matter being read, to show as properties.
+    properties: Option<String>,
+    /// Single line breaks join their lines, as on GitHub (strict line breaks).
+    joined: bool,
     text: &'m dyn Fn(&str) -> pango::Layout,
     /// The view's side margin, which indents add to.
     margin: i32,
@@ -219,8 +282,8 @@ struct Renderer<'m> {
     pending_bullet: bool,
     /// Where each open list item's indent tag sits in `block`, to swap in its hanging indent.
     items: Vec<usize>,
-    /// List indents by (depth, hanging width, right-to-left).
-    indents: HashMap<(usize, i32, bool), gtk::TextTag>,
+    /// List indents by (where text starts, depth, hanging width, right-to-left).
+    indents: HashMap<(i32, usize, i32, bool), gtk::TextTag>,
     code_start: Option<i32>,
     code_language: Option<String>,
     code: Vec<CodeBlock>,
@@ -252,6 +315,21 @@ impl<'m> Renderer<'m> {
         Self {
             folder: folder.cloned(),
             find,
+            source: "",
+            highlights: Vec::new(),
+            tags: Vec::new(),
+            gone: Vec::new(),
+            drawn_to: 0,
+            depth: 0,
+            panels: Vec::new(),
+            open: Vec::new(),
+            left: margin,
+            list_base: 0,
+            frame: None,
+            frames: HashMap::new(),
+            skipping: false,
+            properties: None,
+            joined: settings::get().strict_line_breaks,
             text,
             margin,
             buffer,
@@ -284,10 +362,15 @@ impl<'m> Renderer<'m> {
     }
 
     fn event(&mut self, event: Event, range: Range<usize>) {
+        // A callout's first line is drawn as its header, not as text.
+        let leaf = matches!(event, Event::Text(_) | Event::Code(_) | Event::InlineMath(_) | Event::InlineHtml(_) | Event::FootnoteReference(_));
+        if self.skipping && leaf {
+            return;
+        }
         match event {
-            Event::Start(tag) => self.start(tag),
+            Event::Start(tag) => self.start(tag, range),
             Event::End(tag) => self.end(tag),
-            Event::Text(text) => self.text(&text),
+            Event::Text(text) => self.text_at(&text, range),
             // U+2068…U+2069 isolate the span: `~/notes/a.md` inside Persian stays in order.
             Event::Code(text) => self.styled(&format!("\u{2068}{text}\u{2069}"), self.styles.code.clone(), "<tt>", "</tt>"),
             Event::InlineMath(latex) => self.math(&latex, false),
@@ -303,8 +386,12 @@ impl<'m> Renderer<'m> {
             Event::FootnoteReference(label) => {
                 self.styled(&format!("[{label}]"), self.styles.dim.clone(), "", "")
             }
-            // Single line breaks stay line breaks, as in Obsidian. Each line is its own
-            // paragraph in the view, so Persian and English lines each get their direction.
+            // A callout's header line ends here; what follows is its body.
+            Event::SoftBreak | Event::HardBreak if self.skipping => self.skipping = false,
+            // Single line breaks stay line breaks, as in Obsidian (unless strict line breaks join
+            // them, as GitHub does). Each line is its own paragraph in the view, so Persian and
+            // English lines each get their direction.
+            Event::SoftBreak if self.joined => self.text(" "),
             Event::SoftBreak | Event::HardBreak => self.text("\n"),
             Event::Rule => {
                 self.end_line();
@@ -315,7 +402,7 @@ impl<'m> Renderer<'m> {
         }
     }
 
-    fn start(&mut self, tag: Tag) {
+    fn start(&mut self, tag: Tag, range: Range<usize>) {
         match tag {
             Tag::Paragraph => {
                 if !self.pending_bullet {
@@ -330,20 +417,63 @@ impl<'m> Renderer<'m> {
             Tag::BlockQuote(kind) => {
                 self.end_line();
                 self.quote_depth += 1;
-                self.block.push(self.styles.quote.clone());
-                if let Some(kind) = kind {
-                    let title = match kind {
-                        BlockQuoteKind::Note => "Note",
-                        BlockQuoteKind::Tip => "Tip",
-                        BlockQuoteKind::Important => "Important",
-                        BlockQuoteKind::Warning => "Warning",
-                        BlockQuoteKind::Caution => "Caution",
-                    };
-                    self.styled(title, self.styles.callout.clone(), "", "");
-                    self.end_line();
+                // A callout: one of GitHub's five kinds (the parser has taken its marker), or
+                // Obsidian's, from the quote's first line (drawn as the header instead).
+                let first_line = self.source.get(range.start..).and_then(|rest| rest.lines().next()).unwrap_or("");
+                let written = first_line.trim_start_matches(['>', ' ', '\t']);
+                let callout = match kind {
+                    Some(kind) => {
+                        let (kind, title) = match kind {
+                            BlockQuoteKind::Note => ("note", "Note"),
+                            BlockQuoteKind::Tip => ("tip", "Tip"),
+                            BlockQuoteKind::Important => ("tip", "Important"),
+                            BlockQuoteKind::Warning => ("warning", "Warning"),
+                            BlockQuoteKind::Caution => ("warning", "Caution"),
+                        };
+                        Some(obsidian::Callout { kind, title: title.to_owned(), fold: None })
+                    }
+                    None => obsidian::callout(written).inspect(|_| self.skipping = true),
+                };
+                let Some(callout) = callout else {
+                    // A quote: a bar down its side, its text dimmer.
+                    self.open_panel(Look::Bar(rgba(theme::colors().accent, 0.7)), 16);
+                    self.block.push(self.styles.quote.clone());
+                    return;
+                };
+                let color = callout_color(callout.kind);
+                self.open_panel(Look::Box(rgba(color, 0.10)), 14);
+                // Room above, so a callout right after another doesn't touch it.
+                let header = gtk::TextTag::builder().weight(700).foreground_rgba(&rgba(color, 1.0)).pixels_above_lines(8).build();
+                self.buffer.tag_table().add(&header);
+                // Foldable: the header shows or hides the body ("+" open, "-" closed).
+                let fold = callout.fold.map(|open| {
+                    let fold = gtk::TextTag::builder().invisible(!open).build();
+                    self.buffer.tag_table().add(&fold);
+                    self.targets.push((header.clone(), Target::Fold(fold.clone())));
+                    fold
+                });
+                let title = match callout.fold {
+                    Some(true) => format!("{}  \u{2212}", callout.title),
+                    Some(false) => format!("{}  +", callout.title),
+                    None => callout.title,
+                };
+                self.styled(&title, header, "", "");
+                self.end_line();
+                if let Some(fold) = fold {
+                    let end = self.buffer.end_iter();
+                    let body = self.buffer.create_mark(None, &end, true);
+                    if let Some(open) = self.open.last_mut() {
+                        self.panels[open.panel].fold = Some((fold.clone(), body));
+                        open.fold = Some((end.offset(), fold));
+                    }
                 }
             }
-            Tag::CodeBlock(_) | Tag::MetadataBlock(_) => {
+            // Front matter shows as Obsidian's properties: a name, then its values.
+            Tag::MetadataBlock(_) => {
+                self.end_line();
+                self.properties = Some(String::new());
+            }
+            Tag::CodeBlock(_) => {
                 self.end_line();
                 if let Tag::CodeBlock(CodeBlockKind::Fenced(info)) = &tag {
                     self.code_language = info.split_whitespace().next().map(str::to_owned);
@@ -361,11 +491,15 @@ impl<'m> Renderer<'m> {
                 if self.pending_bullet {
                     self.bullet();
                 }
+                // A checked task's strike-through ends with its own text, before its sub-items.
+                if self.inline.last() == Some(&self.styles.done) {
+                    self.inline.pop();
+                }
                 self.lists.push(List { next: first });
             }
             Tag::Item => {
                 self.end_line();
-                let indent = self.indent(self.lists.len(), 0, false);
+                let indent = self.indent(self.left, self.list_depth(), 0, false);
                 self.items.push(self.block.len());
                 self.block.push(indent);
                 self.pending_bullet = true;
@@ -419,6 +553,7 @@ impl<'m> Renderer<'m> {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph => {
+                self.skipping = false;
                 if self.lists.is_empty() && self.table.is_none() {
                     self.space_last_line(&self.styles.paragraph.clone());
                 }
@@ -433,14 +568,22 @@ impl<'m> Renderer<'m> {
                 }
             }
             TagEnd::BlockQuote(_) => {
+                self.skipping = false;
                 self.end_line();
-                self.block.pop();
                 self.quote_depth -= 1;
+                if let Some(Open { fold: Some((start, fold)), .. }) = self.close_panel() {
+                    self.buffer.apply_tag(&fold, &self.buffer.iter_at_offset(start), &self.buffer.end_iter());
+                }
                 if self.quote_depth == 0 {
                     self.gap();
                 }
             }
-            TagEnd::CodeBlock | TagEnd::MetadataBlock(_) => {
+            TagEnd::MetadataBlock(_) => {
+                if let Some(yaml) = self.properties.take() {
+                    self.show_properties(&yaml);
+                }
+            }
+            TagEnd::CodeBlock => {
                 // A flowchart is drawn; other diagrams are shown as their code.
                 if let Some(source) = self.mermaid.take() {
                     if let Some(chart) = flowchart::parse(&source) {
@@ -484,8 +627,7 @@ impl<'m> Renderer<'m> {
             TagEnd::Table => {
                 if let Some(table) = self.table.take() {
                     let grid = table_widget(table);
-                    let mut end = self.buffer.end_iter();
-                    let anchor = self.buffer.create_child_anchor(&mut end);
+                    let anchor = self.anchor();
                     self.children.push((anchor, grid));
                     self.end_line();
                 }
@@ -498,7 +640,10 @@ impl<'m> Renderer<'m> {
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.pop_inline(),
             TagEnd::Image => {
                 if let Some((url, alt)) = self.image.take() {
-                    self.image(&url, &alt);
+                    // `![[Note]]` puts the note here; anything else is drawn as a picture.
+                    if !self.embed(&url) {
+                        self.image(&url, &alt);
+                    }
                 }
             }
             TagEnd::Superscript | TagEnd::Subscript | TagEnd::DefinitionList
@@ -507,6 +652,201 @@ impl<'m> Renderer<'m> {
     }
 
     /// Plain text in the current styles.
+    /// Text from the note at `range`: Obsidian's highlights and tags in it drawn as such (the
+    /// `==` around a highlight left out), a task with its own mark (`[?]`, `[-]`) as done.
+    fn text_at(&mut self, text: &str, range: Range<usize>) {
+        if let Some(yaml) = &mut self.properties {
+            return yaml.push_str(text);
+        }
+        let source = self.source;
+        let written = source.get(range.clone()) == Some(text);
+        // Already drawn (a task's own mark): left out.
+        if written && range.end <= self.drawn_to {
+            return;
+        }
+        let range = if written { range.start.max(self.drawn_to)..range.end } else { range };
+        let text = if written { &source[range.clone()] } else { text };
+        // A task with its own mark (`[?]`, `[-]`): the parser leaves it as text, often split at
+        // the brackets, so it's read from the note.
+        if self.pending_bullet
+            && let Some(&[b'[', mark, b']', b' ']) = source.as_bytes().get(range.start..range.start + 4)
+            && !matches!(mark, b' ' | b'x' | b'X')
+            && mark.is_ascii_graphic()
+        {
+            self.task(true, range.start..range.start + 3);
+            self.drawn_to = range.start + 4;
+            return self.text_at(text, range);
+        }
+        enum Mark {
+            Highlight,
+            Tag,
+            Gone,
+        }
+        let overlapping = |list: &Vec<Range<usize>>| list.iter().filter(|r| r.start < range.end && range.start < r.end).cloned().collect::<Vec<_>>();
+        let mut marks: Vec<(Range<usize>, Mark)> = overlapping(&self.highlights).into_iter().map(|r| (r, Mark::Highlight)).collect();
+        marks.extend(self.tags.iter().filter(|t| t.start >= range.start && t.end <= range.end).map(|t| (t.clone(), Mark::Tag)));
+        marks.extend(overlapping(&self.gone).into_iter().map(|r| (r, Mark::Gone)));
+        if !written || marks.is_empty() || self.mermaid.is_some() || self.image.is_some() || self.code_start.is_some() {
+            return self.text(text);
+        }
+        marks.sort_by_key(|(mark, _)| mark.start);
+        let mut at = range.start;
+        for (mark, kind) in marks {
+            let start = mark.start.max(range.start).max(at);
+            if start > at {
+                self.text(&source[at..start]);
+            }
+            let end = mark.end.min(range.end).max(start);
+            match kind {
+                Mark::Tag => self.tag(&source[start..end]),
+                Mark::Highlight => {
+                    let (inner_start, inner_end) = ((mark.start + 2).max(start), (mark.end - 2).min(range.end));
+                    if inner_start < inner_end {
+                        self.styled(&source[inner_start..inner_end], self.styles.highlight.clone(), "", "");
+                    }
+                }
+                // Left out, and a space after it too when one comes before it.
+                Mark::Gone => {
+                    if start > range.start && source.as_bytes()[start - 1] == b' ' && source.as_bytes().get(end) == Some(&b' ') {
+                        at = end + 1;
+                        continue;
+                    }
+                }
+            }
+            at = end;
+        }
+        if at < range.end {
+            self.text(&source[at..range.end]);
+        }
+    }
+
+    /// The note to draw (comments and block ids blanked) and Obsidian's additions in it.
+    fn read(&mut self, shown: &'m str, additions: obsidian::Additions) {
+        self.source = shown;
+        self.highlights = additions.highlights;
+        self.tags = additions.tags;
+        self.gone = additions.comments.into_iter().chain(additions.block_ids).collect();
+    }
+
+    /// `![[Note]]` or `![[Note#Heading]]`: the note, or that part of it, drawn here in a frame
+    /// under its name. Two notes deep at most: a note that embeds itself stops there. False when
+    /// `url` isn't a note (a picture, say).
+    fn embed(&mut self, url: &str) -> bool {
+        if links::has_scheme(url) || self.table.is_some() {
+            return false;
+        }
+        let target = links::split(url);
+        let path = links::decode(&target.path);
+        let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        let file = (self.find)(&path);
+        let is_note = |name: &str| name.to_lowercase().ends_with(".md");
+        match &file {
+            Some(file) if !file.basename().is_some_and(|base| is_note(&base.to_string_lossy())) => return false,
+            None if !is_note(&name) && name.contains('.') => return false,
+            _ => {}
+        }
+        let name = name.strip_suffix(".md").unwrap_or(&name);
+        let title = match &target.heading {
+            Some(heading) => format!("{name} \u{203A} {heading}"),
+            None => name.to_owned(),
+        };
+        // Its name links to it; fainter when it doesn't exist yet, as other links.
+        let link = theme::colors().link;
+        let alpha = if file.is_some() { 1.0 } else { 0.55 };
+        let tag = gtk::TextTag::builder()
+            .foreground_rgba(&gdk::RGBA::new(link.r as f32, link.g as f32, link.b as f32, alpha))
+            .weight(600)
+            .build();
+        self.buffer.tag_table().add(&tag);
+        self.targets.push((tag.clone(), Target::Link(url.to_owned())));
+        let text = file
+            .as_ref()
+            .filter(|_| self.depth < 2)
+            .and_then(|file| file.load_contents(None::<&gio::Cancellable>).ok())
+            .map(|(bytes, _)| String::from_utf8_lossy(&bytes).into_owned());
+        let (Some(file), Some(text)) = (file, text) else {
+            // Missing, unreadable or too deep: just its name.
+            self.styled(&title, tag, "", "");
+            return true;
+        };
+        let part = match &target.heading {
+            Some(heading) => section(&text, heading),
+            None => text,
+        };
+        self.end_line();
+        self.open_panel(Look::Bar(rgba(theme::colors().link, 0.9)), 16);
+        self.styled(&title, tag, "", "");
+        self.end_line();
+        let (shown, additions) = prepare(&part);
+        let mut nested = Renderer::new(file.parent().as_ref(), self.find, self.buffer.clone(), self.text, self.left);
+        nested.depth = self.depth + 1;
+        nested.read(&shown, additions);
+        nested.frame = self.frame.clone();
+        for (event, range) in events(&shown) {
+            nested.event(event, range);
+        }
+        nested.end_line();
+        nested.mirror_rtl_indents();
+        // Its checkboxes are the other note's: not ticked from here.
+        self.targets.extend(nested.targets.into_iter().filter(|(_, target)| !matches!(target, Target::Task(_))));
+        self.children.extend(nested.children);
+        self.code.extend(nested.code);
+        self.panels.extend(nested.panels);
+        self.close_panel();
+        self.gap();
+        true
+    }
+
+    /// `#tag`, as a small clickable label that searches for it.
+    fn tag(&mut self, tag: &str) {
+        let accent = theme::colors().accent;
+        let pill = gtk::TextTag::builder()
+            .foreground(accent.to_hex())
+            .background_rgba(&gdk::RGBA::new(accent.r as f32, accent.g as f32, accent.b as f32, 0.14))
+            .build();
+        self.buffer.tag_table().add(&pill);
+        self.targets.push((pill.clone(), Target::Tag(tag.to_owned())));
+        self.styled(tag, pill, "", "");
+    }
+
+    /// Front matter as Obsidian's properties: each name, then its values (tags as tags, links as
+    /// links).
+    fn show_properties(&mut self, yaml: &str) {
+        let rows = obsidian::properties(yaml);
+        if rows.is_empty() {
+            return;
+        }
+        let mut tabs = pango::TabArray::new(1, true);
+        tabs.set_tab(0, pango::TabAlign::Left, 150);
+        let colors = theme::colors();
+        let row = gtk::TextTag::builder().tabs(&tabs).left_margin(self.margin).pixels_below_lines(4).build();
+        self.buffer.tag_table().add(&row);
+        self.block.push(row);
+        for (name, values) in rows {
+            self.styled(&format!("{name}\t"), self.styles.dim.clone(), "", "");
+            let tags = name.eq_ignore_ascii_case("tags");
+            for (i, value) in values.iter().enumerate() {
+                if i > 0 {
+                    self.text(if tags { " " } else { ", " });
+                }
+                if tags {
+                    self.tag(&format!("#{}", value.trim_start_matches('#')));
+                } else if let Some(target) = value.strip_prefix("[[").and_then(|v| v.strip_suffix("]]")) {
+                    let words = target.split_once('|').map_or(target, |(_, words)| words);
+                    let link = gtk::TextTag::builder().foreground(colors.link.to_hex()).underline(pango::Underline::Single).build();
+                    self.buffer.tag_table().add(&link);
+                    self.targets.push((link.clone(), Target::Link(target.split('|').next().unwrap_or(target).to_owned())));
+                    self.styled(words, link, "", "");
+                } else {
+                    self.text(value);
+                }
+            }
+            self.text("\n");
+        }
+        self.block.pop();
+        self.gap();
+    }
+
     fn text(&mut self, text: &str) {
         if let Some(source) = &mut self.mermaid {
             source.push_str(text);
@@ -527,7 +867,7 @@ impl<'m> Renderer<'m> {
         if let Some((_, heading)) = &mut self.heading {
             heading.push_str(text);
         }
-        let tags: Vec<&gtk::TextTag> = self.block.iter().chain(self.inline.iter()).collect();
+        let tags: Vec<&gtk::TextTag> = self.frame.iter().chain(&self.block).chain(&self.inline).collect();
         let mut end = self.buffer.end_iter();
         self.buffer.insert_with_tags(&mut end, text, &tags);
     }
@@ -665,7 +1005,7 @@ impl<'m> Renderer<'m> {
     /// Indents the open list item so its wrapped lines start under its text, not its marker.
     fn hang(&mut self, marker: &str) {
         let Some(&slot) = self.items.last() else { return };
-        let indent = self.indent(self.lists.len(), self.measure(marker), false);
+        let indent = self.indent(self.left, self.list_depth(), self.measure(marker), false);
         self.block[slot] = indent;
     }
 
@@ -728,16 +1068,15 @@ impl<'m> Renderer<'m> {
         if !alt.is_empty() {
             picture.set_alternative_text(Some(alt));
         }
-        let mut end = self.buffer.end_iter();
-        let anchor = self.buffer.create_child_anchor(&mut end);
+        let anchor = self.anchor();
         self.children.push((anchor, picture.upcast()));
     }
 
     /// A diagram on a centred line of its own.
     fn figure(&mut self, widget: gtk::Widget) {
         self.end_line();
-        let mut end = self.buffer.end_iter();
-        let anchor = self.buffer.create_child_anchor(&mut end);
+        let anchor = self.anchor();
+        let end = self.buffer.end_iter();
         let mut start = end;
         start.backward_char();
         self.buffer.apply_tag(&self.styles.figure, &start, &end);
@@ -746,6 +1085,69 @@ impl<'m> Renderer<'m> {
         if self.quote_depth == 0 {
             self.gap();
         }
+    }
+
+    /// A place for a picture, a table or a diagram at the end, in the panel's margins if on one.
+    fn anchor(&mut self) -> gtk::TextChildAnchor {
+        let mut end = self.buffer.end_iter();
+        let anchor = self.buffer.create_child_anchor(&mut end);
+        if let Some(frame) = &self.frame {
+            let mut start = end;
+            start.backward_char();
+            self.buffer.apply_tag(frame, &start, &end);
+        }
+        anchor
+    }
+
+    /// Starts a block on a panel (see `Panel`): a quote, a callout, an embedded note. The panel's
+    /// edge is where text starts now (in a list item: at the item's text), and the block's text
+    /// starts `pad` pixels in from it, on both sides.
+    fn open_panel(&mut self, look: Look, pad: i32) {
+        let edge = match self.items.last() {
+            Some(&slot) => self.block[slot].left_margin(),
+            None => self.left,
+        };
+        let start = self.buffer.create_mark(None, &self.buffer.end_iter(), true);
+        self.panels.push(Panel { start: start.clone(), end: start, inset: edge, look, rtl: false, fold: None });
+        self.open.push(Open {
+            panel: self.panels.len() - 1,
+            blocks: self.block.len(),
+            left: self.left,
+            list_base: self.list_base,
+            frame: self.frame.take(),
+            fold: None,
+        });
+        self.left = edge + pad;
+        self.list_base = self.lists.len();
+        let table = self.buffer.tag_table();
+        let left = self.left;
+        let frame = self.frames.entry(left).or_insert_with(|| {
+            let tag = gtk::TextTag::builder().left_margin(left).right_margin(left).pixels_above_lines(2).pixels_below_lines(2).build();
+            table.add(&tag);
+            tag.set_priority(0);
+            tag
+        });
+        self.frame = Some(frame.clone());
+    }
+
+    /// Ends the innermost panel's block, and says how it was opened.
+    fn close_panel(&mut self) -> Option<Open> {
+        let open = self.open.pop()?;
+        self.block.truncate(open.blocks);
+        self.left = open.left;
+        self.list_base = open.list_base;
+        self.frame = open.frame.clone();
+        let end = self.buffer.end_iter();
+        let panel = &mut self.panels[open.panel];
+        panel.end = self.buffer.create_mark(None, &end, true);
+        let start = self.buffer.iter_at_mark(&panel.start);
+        panel.rtl = pango::find_base_dir(&self.buffer.text(&start, &end, false)) == pango::Direction::Rtl;
+        Some(open)
+    }
+
+    /// How deep the list being written is, counted inside the innermost panel.
+    fn list_depth(&self) -> usize {
+        self.lists.len().saturating_sub(self.list_base)
     }
 
     /// Ends the current line unless the buffer is empty or already at a line start.
@@ -759,12 +1161,12 @@ impl<'m> Renderer<'m> {
 
     /// A list item's indent: its depth's margin, with the first line pulled back by `hang`
     /// pixels so the marker sits in the margin and wrapped lines line up with the text.
-    fn indent(&mut self, depth: usize, hang: i32, rtl: bool) -> gtk::TextTag {
+    fn indent(&mut self, left: i32, depth: usize, hang: i32, rtl: bool) -> gtk::TextTag {
         let table = self.buffer.tag_table();
         self.indents
-            .entry((depth, hang, rtl))
+            .entry((left, depth, hang, rtl))
             .or_insert_with(|| {
-                let margin = self.margin + 6 + 22 * (depth.max(1) as i32 - 1) + hang;
+                let margin = left + 6 + 22 * (depth.max(1) as i32 - 1) + hang;
                 let tag = if rtl {
                     gtk::TextTag::builder().right_margin(margin).indent(-hang).pixels_below_lines(4).build()
                 } else {
@@ -821,24 +1223,25 @@ impl<'m> Renderer<'m> {
             children: self.children,
             headings: self.headings,
             code: self.code,
+            panels: self.panels,
         }
     }
 
     /// List indents are on the left; move them to the right on right-to-left lines.
     fn mirror_rtl_indents(&mut self) {
-        let ltr: Vec<((usize, i32), gtk::TextTag)> = self
+        let ltr: Vec<((i32, usize, i32), gtk::TextTag)> = self
             .indents
             .iter()
-            .filter(|((_, _, rtl), _)| !rtl)
-            .map(|((depth, hang, _), tag)| ((*depth, *hang), tag.clone()))
+            .filter(|((_, _, _, rtl), _)| !rtl)
+            .map(|((left, depth, hang, _), tag)| ((*left, *depth, *hang), tag.clone()))
             .collect();
         for line in 0..self.buffer.line_count() {
             let Some(start) = self.buffer.iter_at_line(line) else { continue };
-            let Some(((depth, hang), tag)) = ltr.iter().find(|(_, tag)| start.has_tag(tag)) else { continue };
+            let Some(((left, depth, hang), tag)) = ltr.iter().find(|(_, tag)| start.has_tag(tag)) else { continue };
             let mut end = start;
             end.forward_to_line_end();
             if pango::find_base_dir(&self.buffer.text(&start, &end, false)) == pango::Direction::Rtl {
-                let rtl = self.indent(*depth, *hang, true);
+                let rtl = self.indent(*left, *depth, *hang, true);
                 self.buffer.remove_tag(tag, &start, &end);
                 self.buffer.apply_tag(&rtl, &start, &end);
             }
@@ -914,6 +1317,50 @@ fn language(manager: &sourceview::LanguageManager, name: &str) -> Option<sourcev
         other => other,
     };
     manager.language(id).or_else(|| manager.guess_language(Some(format!("file.{name}")), None))
+}
+
+/// A note as it is drawn: Obsidian's %%comments%% and ^block ids blanked with spaces (so
+/// everything else stays where it is in the note, and a checkbox click finds its place), and
+/// Obsidian's additions in it.
+fn prepare(source: &str) -> (String, obsidian::Additions) {
+    let additions = obsidian::additions(source);
+    let mut shown = source.to_owned();
+    for range in additions.comments.iter().chain(&additions.block_ids) {
+        shown.replace_range(range.clone(), &" ".repeat(range.len()));
+    }
+    (shown, additions)
+}
+
+/// The part of `text` under `heading` (as a `#heading` link names it): from that heading to
+/// the next one as big or bigger; all of it when there's no such heading.
+fn section(text: &str, heading: &str) -> String {
+    let headings = crate::outline::headings(text);
+    let Some(at) = headings.iter().position(|h| crate::anchors::points_at(heading, &h.text)) else { return text.to_owned() };
+    let level = headings[at].level;
+    let end = headings[at + 1..].iter().find(|h| h.level <= level).map(|h| h.line);
+    let lines: Vec<&str> = text.lines().collect();
+    lines[headings[at].line..end.unwrap_or(lines.len())].join("\n")
+}
+
+/// A theme colour as GDK's, `alpha` opaque.
+fn rgba(color: crate::color::Rgb, alpha: f32) -> gdk::RGBA {
+    gdk::RGBA::new(color.r as f32, color.g as f32, color.b as f32, alpha)
+}
+
+/// A callout kind's colour, from the theme: blue for notes, green for success, yellow for
+/// questions, orange for warnings, red for failures and bugs…
+fn callout_color(kind: &str) -> crate::color::Rgb {
+    let c = theme::colors();
+    match kind {
+        "abstract" | "tip" => c.function,
+        "success" => c.added,
+        "question" => c.changed,
+        "warning" => c.number,
+        "failure" | "danger" | "bug" => c.removed,
+        "example" => c.keyword,
+        "quote" => c.dim,
+        _ => c.link,
+    }
 }
 
 /// An Obsidian picture size: "300" (the width) or "300x200".

@@ -29,6 +29,8 @@ pub struct Settings {
     /// Markdown is edited in Live Preview (markup hidden except where the cursor is), rather
     /// than as plain source.
     pub live_preview: bool,
+    /// Single line breaks join their lines, as on GitHub, rather than show (as in Obsidian).
+    pub strict_line_breaks: bool,
     /// Text size, in points.
     pub text_size: f64,
 }
@@ -50,6 +52,7 @@ impl Default for Settings {
             spell_check: false,
             centered: false,
             live_preview: true,
+            strict_line_breaks: false,
             text_size: DEFAULT_TEXT_SIZE,
         }
     }
@@ -120,6 +123,7 @@ fn parse(text: &str) -> Settings {
             "spell-check" => settings.spell_check = flag.unwrap_or(settings.spell_check),
             "centered" => settings.centered = flag.unwrap_or(settings.centered),
             "live-preview" => settings.live_preview = flag.unwrap_or(settings.live_preview),
+            "strict-line-breaks" => settings.strict_line_breaks = flag.unwrap_or(settings.strict_line_breaks),
             "text-size" => {
                 if let Ok(size) = value.parse::<f64>() {
                     settings.text_size = size.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE);
@@ -133,8 +137,8 @@ fn parse(text: &str) -> Settings {
 
 fn to_text(s: &Settings) -> String {
     format!(
-        "wrap = {}\nline-numbers = {}\ncontinue-lists = {}\nopen-rendered = {}\noutside-in-window = {}\ntab-bar-always = {}\nautosave = {}\nspell-check = {}\ncentered = {}\nlive-preview = {}\ntext-size = {}\n",
+        "wrap = {}\nline-numbers = {}\ncontinue-lists = {}\nopen-rendered = {}\noutside-in-window = {}\ntab-bar-always = {}\nautosave = {}\nspell-check = {}\ncentered = {}\nlive-preview = {}\nstrict-line-breaks = {}\ntext-size = {}\n",
         s.wrap, s.line_numbers, s.continue_lists, s.open_rendered, s.outside_in_window, s.tab_bar_always, s.autosave, s.spell_check,
-        s.centered, s.live_preview, s.text_size
+        s.centered, s.live_preview, s.strict_line_breaks, s.text_size
     )
 }

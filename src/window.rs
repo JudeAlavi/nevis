@@ -672,7 +672,7 @@ impl Window {
     }
 
     /// Opens the search through the notes of this window's folder on `text` (a tag chosen).
-    fn search_for(self: &Rc<Self>, text: &str) {
+    pub fn search_for(self: &Rc<Self>, text: &str) {
         let Some(root) = self.browsed_folder() else { return };
         let search = self.search_popup();
         search.set_query(text);
@@ -1337,7 +1337,9 @@ pub fn init() {
     settings::on_change(|old, new| {
         if old.text_size != new.text_size {
             theme::apply_font();
-            // Rendered views again: list indents and diagrams follow the font.
+        }
+        // Rendered views again: list indents and diagrams follow the font; lines join or not.
+        if old.text_size != new.text_size || old.strict_line_breaks != new.strict_line_breaks {
             all_editors().iter().for_each(|editor| editor.refresh(false));
         }
         if new.spell_check && !old.spell_check && !crate::spelling::available() {

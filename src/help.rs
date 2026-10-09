@@ -77,6 +77,8 @@ const RIGHT: &[(&str, &[Row])] = &[
     ("Rendered view", &[
         row("Follow a link", "", "Click"),
         row("Tick a checkbox", "", "Click"),
+        row("Search for a #tag", "", "Click"),
+        row("Fold or unfold a callout", "", "Click its title"),
         row("Edit the source", "", "Double-click"),
     ]),
 ];

@@ -40,7 +40,7 @@ pub struct Editor {
     pub buffer: sourceview::Buffer,
     /// Styles Markdown in the source view.
     styler: Rc<style::Styler>,
-    reader: sourceview::View,
+    reader: crate::reader::Reader,
     /// Location, encoding and line endings of the file on disk.
     file: sourceview::File,
     /// Watches the file for changes made by other programs.
@@ -141,7 +141,7 @@ impl Editor {
         view.set_show_line_numbers(preferences.line_numbers);
         view.set_extra_menu(Some(&crate::window::menu_model()));
 
-        let reader = sourceview::View::new();
+        let reader = crate::reader::Reader::new();
         reader.add_css_class("nevis-read");
         reader.set_editable(false);
         reader.set_cursor_visible(false);
@@ -772,6 +772,7 @@ impl Editor {
         let rendered =
             render::render(&text, folder.as_ref(), &find, theme::scheme().as_ref(), &layout, self.reader_margin.get());
         self.reader.set_buffer(Some(&rendered.buffer));
+        self.reader.set_panels(rendered.panels);
         for (anchor, widget) in &rendered.children {
             self.reader.add_child_at_anchor(widget, anchor);
         }
@@ -1010,13 +1011,12 @@ impl Editor {
         let text = String::from_utf8_lossy(&bytes);
         // Enough to know the note by, not the whole of a long one.
         let start = text.lines().take(40).collect::<Vec<_>>().join("\n");
-        let view = sourceview::View::builder()
-            .editable(false)
-            .cursor_visible(false)
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .top_margin(10)
-            .bottom_margin(10)
-            .build();
+        let view = crate::reader::Reader::new();
+        view.set_editable(false);
+        view.set_cursor_visible(false);
+        view.set_wrap_mode(gtk::WrapMode::WordChar);
+        view.set_top_margin(10);
+        view.set_bottom_margin(10);
         view.add_css_class("nevis-preview");
         let folder = file.parent();
         let near = folder.as_ref().and_then(|folder| folder.path());
@@ -1027,6 +1027,7 @@ impl Editor {
         let layout = |text: &str| view.create_pango_layout(Some(text));
         let rendered = render::render(&start, folder.as_ref(), &find, theme::scheme().as_ref(), &layout, 14);
         view.set_buffer(Some(&rendered.buffer));
+        view.set_panels(rendered.panels);
         view.set_left_margin(14);
         view.set_right_margin(14);
         for (anchor, widget) in &rendered.children {
@@ -1073,6 +1074,27 @@ impl Editor {
             Target::File(file) => {
                 if let Some(host) = self.host.upgrade() {
                     host.open(file, None, if new_tab { How::NewTab } else { How::Replace });
+                }
+            }
+            Target::Tag(tag) => {
+                if let Some(host) = self.host.upgrade() {
+                    host.search_for(&tag);
+                }
+            }
+            Target::Fold(fold) => {
+                let opening = fold.is_invisible();
+                fold.set_invisible(!opening);
+                // The header's last character says which: "−" open, "+" closed.
+                let header = self.targets.borrow().iter().find(|(_, target)| matches!(target, Target::Fold(f) if *f == fold)).map(|(tag, _)| tag.clone());
+                if let Some(header) = header {
+                    let buffer = self.reader.buffer();
+                    let mut end = buffer.start_iter();
+                    if (end.starts_tag(Some(&header)) || end.forward_to_tag_toggle(Some(&header))) && end.forward_to_tag_toggle(Some(&header)) {
+                        let mut sign = end;
+                        sign.backward_char();
+                        buffer.delete(&mut sign, &mut end);
+                        buffer.insert_with_tags(&mut sign, if opening { "\u{2212}" } else { "+" }, &[&header]);
+                    }
                 }
             }
         }
@@ -1928,7 +1950,7 @@ struct Reload {
 pub fn warm_up() {
     let source = sourceview::View::new();
     source.add_css_class("nevis-editor");
-    let reader = sourceview::View::new();
+    let reader = crate::reader::Reader::new();
     reader.add_css_class("nevis-read");
     // A tab bar with a tab, as windows with two tabs or more show.
     let tab = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -1944,7 +1966,7 @@ pub fn warm_up() {
     content.append(&reader);
     let window = gtk::Window::builder().child(&content).build();
     WidgetExt::realize(&window);
-    for view in [&source, &reader] {
+    for view in [&source, reader.upcast_ref()] {
         let layout = view.create_pango_layout(None);
         layout.set_markup("Text <b>bold</b> <i>italic</i> <tt>code</tt> فارسی <b>پررنگ</b> <i>کج</i> ۱۲۳");
         let _ = layout.pixel_size();

@@ -68,6 +68,8 @@ impl SettingsPage {
         row(&body, "Markdown files open", None, &opens);
         let editing = page.choice(&[("Live preview", true), ("Source", false)], |s| s.live_preview, |s, v| s.live_preview = v);
         row(&body, "Edit Markdown as", Some("Live preview hides the markup except on the line you're editing"), &editing);
+        let breaks = page.choice(&[("Shown", false), ("Joined", true)], |s| s.strict_line_breaks, |s, v| s.strict_line_breaks = v);
+        row(&body, "Single line breaks", Some("Shown, as in Obsidian, or joined into the paragraph, as on GitHub"), &breaks);
         let spelling = page.switch(|s| s.spell_check, |s, on| s.spell_check = on);
         row(&body, "Check spelling", Some("Right-click a word for corrections and the language. Code and Persian are skipped."), &spelling);
         let autosave = page.switch(|s| s.autosave, |s, on| s.autosave = on);

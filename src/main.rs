@@ -25,6 +25,7 @@ mod popup;
 mod positions;
 mod prefs;
 mod prompt;
+mod reader;
 mod render;
 mod search;
 mod session;

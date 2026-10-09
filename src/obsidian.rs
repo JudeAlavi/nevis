@@ -11,7 +11,10 @@ use crate::render;
 /// the start of a line or a space, letters, digits, `_`, `-` and `/`, at least one of them
 /// not a digit; never in code.
 pub fn tags(text: &str) -> Vec<Range<usize>> {
-    let code = code(text);
+    tags_outside(text, &code(text))
+}
+
+fn tags_outside(text: &str, code: &[Range<usize>]) -> Vec<Range<usize>> {
     let mut found = Vec::new();
     let mut previous: Option<char> = None;
     for (at, c) in text.char_indices() {
@@ -39,6 +42,192 @@ pub fn tags(text: &str) -> Vec<Range<usize>> {
     found
 }
 
+/// An Obsidian callout, from the first line of its quote: `[!tip]- Read this`.
+#[derive(Debug, PartialEq)]
+pub struct Callout {
+    /// Which of Obsidian's kinds it looks like (an unknown kind looks like a note).
+    pub kind: &'static str,
+    pub title: String,
+    /// Foldable: open (`+`) or closed (`-`); `None` when it doesn't fold.
+    pub fold: Option<bool>,
+}
+
+/// Obsidian's callout kinds, each with the other names it goes by.
+const KINDS: [(&str, &[&str]); 13] = [
+    ("note", &["note"]),
+    ("abstract", &["abstract", "summary", "tldr"]),
+    ("info", &["info"]),
+    ("todo", &["todo"]),
+    ("tip", &["tip", "hint", "important"]),
+    ("success", &["success", "check", "done"]),
+    ("question", &["question", "help", "faq"]),
+    ("warning", &["warning", "caution", "attention"]),
+    ("failure", &["failure", "fail", "missing"]),
+    ("danger", &["danger", "error"]),
+    ("bug", &["bug"]),
+    ("example", &["example"]),
+    ("quote", &["quote", "cite"]),
+];
+
+/// The callout a quote's first line (after its `>`) starts, if it starts one: `[!kind]`, a
+/// `+` or `-` to fold, then the title (the kind, capitalised, when there's none). Text after
+/// a `|` in the brackets is for styling, and left out.
+pub fn callout(line: &str) -> Option<Callout> {
+    let rest = line.trim_start().strip_prefix("[!")?;
+    let close = rest.find(']')?;
+    let written = rest[..close].split('|').next()?.trim();
+    if written.is_empty() || !written.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    let after = &rest[close + 1..];
+    let (fold, title) = match after.strip_prefix('+') {
+        Some(title) => (Some(true), title),
+        None => match after.strip_prefix('-') {
+            Some(title) => (Some(false), title),
+            None => (None, after),
+        },
+    };
+    let lower = written.to_lowercase();
+    let kind = KINDS.iter().find(|(_, names)| names.contains(&lower.as_str())).map_or("note", |(kind, _)| kind);
+    let title = match title.trim() {
+        "" => {
+            let mut letters = written.chars();
+            letters.next().map(|first| first.to_uppercase().chain(letters).collect()).unwrap_or_default()
+        }
+        title => title.to_owned(),
+    };
+    Some(Callout { kind, title, fold })
+}
+
+/// The `==highlights==` in `text`, as byte ranges with their markers: on one line, with
+/// something in them, never in code.
+fn highlights_outside(text: &str, code: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let mut at = 0;
+        while let Some(open) = line[at..].find("==").map(|i| at + i) {
+            let Some(close) = line[open + 2..].find("==").map(|i| open + 2 + i) else { break };
+            let inner = &line[open + 2..close];
+            // Like emphasis: something in it, touching both markers.
+            let marks = !inner.is_empty() && !inner.starts_with(char::is_whitespace) && !inner.ends_with(char::is_whitespace);
+            let range = offset + open..offset + close + 2;
+            if marks && !code.iter().any(|c| c.contains(&range.start)) {
+                found.push(range);
+                at = close + 2;
+            } else {
+                at = open + 2;
+            }
+        }
+        offset += line.len();
+    }
+    found
+}
+
+/// The `%%comments%%` in `text`, as byte ranges with their markers: from a `%%` to the next,
+/// across lines too; one that isn't closed runs to the end. `\%%` and code don't count.
+fn comments_outside(text: &str, code: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut markers = Vec::new();
+    let mut at = 0;
+    while let Some(found) = text[at..].find("%%").map(|i| at + i) {
+        let escaped = text[..found].ends_with('\\');
+        if !escaped && !code.iter().any(|c| c.contains(&found)) {
+            markers.push(found);
+        }
+        at = found + 2;
+    }
+    markers
+        .chunks(2)
+        .map(|pair| match pair {
+            [open, close] => *open..close + 2,
+            [open] => *open..text.len(),
+            _ => unreachable!("chunks of two"),
+        })
+        .collect()
+}
+
+/// The block ids in `text` (`^id` ending a line, after a space or alone on it), as byte ranges.
+fn block_ids_outside(text: &str, code: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end();
+        if let Some(caret) = content.rfind('^') {
+            let (before, id) = (&content[..caret], &content[caret + 1..]);
+            let spaced = before.is_empty() || before.ends_with([' ', '\t']);
+            let start = offset + caret;
+            if spaced
+                && !id.is_empty()
+                && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && !code.iter().any(|c| c.contains(&start))
+            {
+                found.push(start..start + 1 + id.len());
+            }
+        }
+        offset += line.len();
+    }
+    found
+}
+
+/// A note's properties (its front matter, without the `---` lines), as Obsidian lists them:
+/// each name with its values (`key: value`, `key: [a, b]`, or `- item` lines under it).
+pub fn properties(yaml: &str) -> Vec<(String, Vec<String>)> {
+    let unquote = |value: &str| {
+        let value = value.trim();
+        let quoted = value.len() >= 2 && ((value.starts_with('"') && value.ends_with('"')) || (value.starts_with('\'') && value.ends_with('\'')));
+        if quoted { value[1..value.len() - 1].to_owned() } else { value.to_owned() }
+    };
+    let mut found: Vec<(String, Vec<String>)> = Vec::new();
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // "- item" lines belong to the name above them.
+        if let Some(item) = trimmed.strip_prefix('-').filter(|_| line.starts_with([' ', '\t', '-'])) {
+            if let Some((_, values)) = found.last_mut()
+                && !item.trim().is_empty()
+            {
+                values.push(unquote(item));
+            }
+            continue;
+        }
+        let Some((name, value)) = trimmed.split_once(':') else { continue };
+        let value = value.trim();
+        let values = match value.strip_prefix('[').and_then(|list| list.strip_suffix(']')) {
+            Some(list) => list.split(',').map(unquote).filter(|item| !item.is_empty()).collect(),
+            None if value.is_empty() => Vec::new(),
+            None => vec![unquote(value)],
+        };
+        found.push((name.trim().to_owned(), values));
+    }
+    found
+}
+
+/// Obsidian's additions in a note, read with its code found once.
+pub struct Additions {
+    pub highlights: Vec<Range<usize>>,
+    pub tags: Vec<Range<usize>>,
+    pub comments: Vec<Range<usize>>,
+    pub block_ids: Vec<Range<usize>>,
+}
+
+/// All of Obsidian's additions in `text` (as `highlights`, `tags`, `comments`, `block_ids`).
+pub fn additions(text: &str) -> Additions {
+    additions_in(text, &code(text))
+}
+
+/// The same, given where `text`'s code and math are (its parse found them already): what is in
+/// them doesn't count.
+pub fn additions_in(text: &str, code: &[Range<usize>]) -> Additions {
+    Additions {
+        highlights: highlights_outside(text, code),
+        tags: tags_outside(text, code),
+        comments: comments_outside(text, code),
+        block_ids: block_ids_outside(text, code),
+    }
+}
+
 /// What a tag may be made of, besides "/": letters and digits of any script, "_" and "-",
 /// combining marks, the Persian half-space, and emoji.
 fn tag_letter(c: char) -> bool {
@@ -52,7 +241,7 @@ fn tag_letter(c: char) -> bool {
 fn code(text: &str) -> Vec<Range<usize>> {
     render::events(text)
         .filter_map(|(event, range)| match event {
-            Event::Code(_) | Event::Start(Tag::CodeBlock(_)) => Some(range),
+            Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) | Event::Start(Tag::CodeBlock(_)) => Some(range),
             _ => None,
         })
         .collect()
@@ -70,6 +259,63 @@ mod tests {
     fn tags_take_letters_of_any_script_digits_and_nesting() {
         let text = "#tag and #nested/tag, #کتاب_ها #y1984\n#1984 is a year";
         assert_eq!(found(text, &tags(text)), vec!["#tag", "#nested/tag", "#کتاب_ها", "#y1984"]);
+    }
+
+    fn callout_of(kind: &'static str, title: &str, fold: Option<bool>) -> Option<Callout> {
+        Some(Callout { kind, title: title.to_owned(), fold })
+    }
+
+    #[test]
+    fn a_callouts_first_line_gives_its_kind_title_and_folding() {
+        assert_eq!(callout("[!tip] Read this"), callout_of("tip", "Read this", None));
+        assert_eq!(callout("[!hint]"), callout_of("tip", "Hint", None));
+        assert_eq!(callout("[!FAQ]- Why?"), callout_of("question", "Why?", Some(false)));
+        assert_eq!(callout("[!todo]+"), callout_of("todo", "Todo", Some(true)));
+        assert_eq!(callout("[!caution] Hot"), callout_of("warning", "Hot", None));
+    }
+
+    #[test]
+    fn unknown_kinds_look_like_notes_and_plain_quotes_are_not_callouts() {
+        assert_eq!(callout("[!recipe|wide] Pasta"), callout_of("note", "Pasta", None));
+        assert_eq!(callout("[!my-type]"), callout_of("note", "My-type", None));
+        assert_eq!(callout("Just a quote"), None);
+        assert_eq!(callout("[!] nothing"), None);
+        assert_eq!(callout("[!two words] no"), None);
+    }
+
+    #[test]
+    fn highlights_stay_on_one_line_and_have_something_in_them() {
+        let text = "a ==marked== b ==== c ==two\nlines== `==code==` ==Persian نشان==";
+        assert_eq!(found(text, &additions(text).highlights), vec!["==marked==", "==Persian نشان=="]);
+    }
+
+    #[test]
+    fn comments_run_to_the_next_double_percent_or_the_end() {
+        let text = "keep %%hidden%% keep\n%%\nblock\n\nstill\n%% after `%%code%%` \\%%escaped %%open to the end";
+        assert_eq!(found(text, &additions(text).comments), vec!["%%hidden%%", "%%\nblock\n\nstill\n%%", "%%open to the end"]);
+    }
+
+    #[test]
+    fn block_ids_end_a_line_after_a_space_or_stand_alone() {
+        let text = "A paragraph ^para-1\n- item ^item_2\n^standalone\nnot^this\n`code ^no`\nend ^x y";
+        assert_eq!(found(text, &additions(text).block_ids), vec!["^para-1", "^item_2", "^standalone"]);
+    }
+
+    #[test]
+    fn properties_read_text_lists_and_quoted_links() {
+        let yaml = "title: Trip plan\ntags:\n  - travel\n  - sicily\naliases: [Plan, \"Sicily trip\"]\nrelated: \"[[Plans]]\"\ntime: 10:30\nempty:\n";
+        let owned = |list: &[&str]| list.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            properties(yaml),
+            vec![
+                ("title".to_owned(), owned(&["Trip plan"])),
+                ("tags".to_owned(), owned(&["travel", "sicily"])),
+                ("aliases".to_owned(), owned(&["Plan", "Sicily trip"])),
+                ("related".to_owned(), owned(&["[[Plans]]"])),
+                ("time".to_owned(), owned(&["10:30"])),
+                ("empty".to_owned(), owned(&[])),
+            ]
+        );
     }
 
     #[test]
