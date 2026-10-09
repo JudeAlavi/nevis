@@ -7,7 +7,7 @@ use gtk::{gdk, gio, glib, pango, prelude::*};
 use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use sourceview::prelude::*;
 
-use crate::{flowchart, links, math, obsidian, sequence, settings, state};
+use crate::{classes, flowchart, links, math, obsidian, sequence, settings, state};
 use crate::theme::{self, fonts};
 
 /// What a click on the rendered text does.
@@ -624,6 +624,10 @@ impl<'m> Renderer<'m> {
                     if let Some(chart) = state::parse(&source) {
                         self.code_language = None;
                         return self.figure(flowchart::picture(&chart, self.text).upcast());
+                    }
+                    if let Some(diagram) = classes::parse(&source) {
+                        self.code_language = None;
+                        return self.figure(classes::picture(&diagram, self.text).upcast());
                     }
                     if let Some(diagram) = sequence::parse(&source) {
                         self.code_language = None;

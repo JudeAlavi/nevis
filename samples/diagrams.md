@@ -77,6 +77,28 @@ stateDiagram-v2
     }
 ```
 
+A class diagram: compartments, every UML end, counts, a note, a namespace:
+
+```mermaid
+classDiagram
+    class Animal {
+        <<interface>>
+        +String name
+        +makeSound() void
+    }
+    class Duck {
+        +swim()
+    }
+    Animal <|-- Duck
+    Animal "1" *-- "4" Leg : has
+    Pond o-- Duck
+    Duck ..> Water : needs
+    note for Duck "can fly too"
+    namespace Lake {
+        class Pond
+    }
+```
+
 None of those, so it stays code:
 
 ```mermaid

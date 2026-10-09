@@ -66,6 +66,11 @@ pub enum End {
     Arrow,
     Circle,
     Cross,
+    /// A class diagram's: a hollow triangle (inheritance), a diamond (composition), a hollow
+    /// one (aggregation).
+    Triangle,
+    Diamond,
+    HollowDiamond,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -524,26 +529,7 @@ pub fn picture(chart: &Chart, text: &dyn Fn(&str) -> pango::Layout) -> gtk::Pict
     let (line, border, fill, ink, ground) =
         (color(&theme::colors().dim.to_hex()), color(&theme::colors().marker.to_hex()), color(&theme::colors().quote_background.to_hex()), color(&theme::colors().text.to_hex()), color(&theme::colors().background.to_hex()));
     let snapshot = gtk::Snapshot::new();
-    // Subgraphs: a box round each one's nodes and the boxes inside it, its name at its top; the
-    // picture grows to hold them.
-    let boxes = group_boxes(chart, &laid);
-    let (left, top) = boxes.iter().fold((0.0f32, 0.0f32), |(x, y), (rect, _)| (x.min(rect.x()), y.min(rect.y())));
-    let (right, bottom) = boxes
-        .iter()
-        .fold((laid.width as f32, laid.height as f32), |(x, y), (rect, _)| (x.max(rect.x() + rect.width()), y.max(rect.y() + rect.height())));
-    snapshot.translate(&graphene::Point::new(-left, -top));
-    for (rect, group) in &boxes {
-        let outline = gsk::RoundedRect::from_rect(*rect, 8.0);
-        snapshot.push_rounded_clip(&outline);
-        snapshot.append_color(&gdk::RGBA::new(fill.red(), fill.green(), fill.blue(), 0.5), rect);
-        snapshot.pop();
-        snapshot.append_border(&outline, &[1.0; 4], &[border; 4]);
-        let name = text(&chart.groups[*group].label);
-        snapshot.save();
-        snapshot.translate(&graphene::Point::new(rect.x() + 10.0, rect.y() + 4.0));
-        snapshot.append_layout(&name, &color(&theme::colors().dim.to_hex()));
-        snapshot.restore();
-    }
+    let (left, top, right, bottom) = draw_groups(&snapshot, chart, &laid, text);
     let write = |layout: &pango::Layout, extents: &pango::Rectangle, (x, y): (f64, f64), ink: &gdk::RGBA| {
         snapshot.save();
         let left = x - extents.width() as f64 / 2.0 - extents.x() as f64;
@@ -601,6 +587,32 @@ pub fn picture(chart: &Chart, text: &dyn Fn(&str) -> pango::Layout) -> gtk::Pict
     picture.set_size_request(width as i32, (tall * width / wide.max(1.0)) as i32);
     picture.set_alternative_text(Some("Flowchart"));
     picture
+}
+
+/// Subgraphs: a box round each one's nodes and the boxes inside it, its name at its top. The
+/// snapshot is moved so that they fit; the picture's bounds (left, top, right, bottom).
+pub fn draw_groups(snapshot: &gtk::Snapshot, chart: &Chart, laid: &Layout, text: &dyn Fn(&str) -> pango::Layout) -> (f32, f32, f32, f32) {
+    let boxes = group_boxes(chart, laid);
+    let (left, top) = boxes.iter().fold((0.0f32, 0.0f32), |(x, y), (rect, _)| (x.min(rect.x()), y.min(rect.y())));
+    let (right, bottom) = boxes
+        .iter()
+        .fold((laid.width as f32, laid.height as f32), |(x, y), (rect, _)| (x.max(rect.x() + rect.width()), y.max(rect.y() + rect.height())));
+    snapshot.translate(&graphene::Point::new(-left, -top));
+    let colors = theme::colors();
+    let (fill, border, dim) = (crate::render::rgba(colors.quote_background, 0.5), crate::render::rgba(colors.marker, 1.0), crate::render::rgba(colors.dim, 1.0));
+    for (rect, group) in &boxes {
+        let outline = gsk::RoundedRect::from_rect(*rect, 8.0);
+        snapshot.push_rounded_clip(&outline);
+        snapshot.append_color(&fill, rect);
+        snapshot.pop();
+        snapshot.append_border(&outline, &[1.0; 4], &[border; 4]);
+        let name = text(&chart.groups[*group].label);
+        snapshot.save();
+        snapshot.translate(&graphene::Point::new(rect.x() + 10.0, rect.y() + 4.0));
+        snapshot.append_layout(&name, &dim);
+        snapshot.restore();
+    }
+    (left, top, right, bottom)
 }
 
 /// Room round a subgraph's nodes in its box, and above them for its name.
@@ -716,18 +728,19 @@ fn outline(shape: Shape, rect: Rect) -> gsk::Path {
 }
 
 /// An edge along `points`: rounded at its bends, stopping short of its arrowheads.
-fn draw_edge(snapshot: &gtk::Snapshot, edge: &Edge, points: &[(f64, f64)], color: &gdk::RGBA) {
+pub fn draw_edge(snapshot: &gtk::Snapshot, edge: &Edge, points: &[(f64, f64)], color: &gdk::RGBA) {
     let mut points: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x as f32, y as f32)).collect();
     let n = points.len();
     if n < 2 {
         return;
     }
     let (head, tail) = ((points[n - 1], points[n - 2]), (points[0], points[1]));
-    if edge.head == End::Arrow {
-        points[n - 1] = towards(head.0, head.1, ARROW);
+    // The line stops where an end's mark starts.
+    if end_length(edge.head) > 0.0 {
+        points[n - 1] = towards(head.0, head.1, end_length(edge.head));
     }
-    if edge.tail == End::Arrow {
-        points[0] = towards(tail.0, tail.1, ARROW);
+    if end_length(edge.tail) > 0.0 {
+        points[0] = towards(tail.0, tail.1, end_length(edge.tail));
     }
     let path = gsk::PathBuilder::new();
     path.move_to(points[0].0, points[0].1);
@@ -749,8 +762,18 @@ fn draw_edge(snapshot: &gtk::Snapshot, edge: &Edge, points: &[(f64, f64)], color
     draw_end(snapshot, edge.tail, tail.0, tail.1, color);
 }
 
+/// How far an end's mark reaches back along its edge.
+fn end_length(end: End) -> f32 {
+    match end {
+        End::Arrow => ARROW,
+        End::Triangle => ARROW * 1.3,
+        End::Diamond | End::HollowDiamond => ARROW * 2.0,
+        End::Plain | End::Circle | End::Cross => 0.0,
+    }
+}
+
 /// The mark at an edge's end `tip`, coming from `from`.
-fn draw_end(snapshot: &gtk::Snapshot, end: End, tip: (f32, f32), from: (f32, f32), color: &gdk::RGBA) {
+pub fn draw_end(snapshot: &gtk::Snapshot, end: End, tip: (f32, f32), from: (f32, f32), color: &gdk::RGBA) {
     let length = distance(tip, from).max(0.001);
     let (dx, dy) = ((tip.0 - from.0) / length, (tip.1 - from.1) / length);
     let path = gsk::PathBuilder::new();
@@ -777,6 +800,31 @@ fn draw_end(snapshot: &gtk::Snapshot, end: End, tip: (f32, f32), from: (f32, f32
             path.line_to(cx - r, cy + r);
             snapshot.append_stroke(&path.to_path(), &gsk::Stroke::new(1.6), color);
         }
+        End::Triangle => {
+            let length = end_length(end);
+            let base = (tip.0 - dx * length, tip.1 - dy * length);
+            let side = (-dy * length * 0.55, dx * length * 0.55);
+            path.move_to(tip.0, tip.1);
+            path.line_to(base.0 + side.0, base.1 + side.1);
+            path.line_to(base.0 - side.0, base.1 - side.1);
+            path.close();
+            snapshot.append_stroke(&path.to_path(), &gsk::Stroke::new(1.4), color);
+        }
+        End::Diamond | End::HollowDiamond => {
+            let length = end_length(end);
+            let middle = (tip.0 - dx * length / 2.0, tip.1 - dy * length / 2.0);
+            let side = (-dy * length * 0.3, dx * length * 0.3);
+            path.move_to(tip.0, tip.1);
+            path.line_to(middle.0 + side.0, middle.1 + side.1);
+            path.line_to(tip.0 - dx * length, tip.1 - dy * length);
+            path.line_to(middle.0 - side.0, middle.1 - side.1);
+            path.close();
+            if end == End::Diamond {
+                snapshot.append_fill(&path.to_path(), gsk::FillRule::Winding, color);
+            } else {
+                snapshot.append_stroke(&path.to_path(), &gsk::Stroke::new(1.4), color);
+            }
+        }
     }
 }
 
@@ -785,7 +833,7 @@ fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
 }
 
 /// The point `by` from `from` on the way to `to`.
-fn towards(from: (f32, f32), to: (f32, f32), by: f32) -> (f32, f32) {
+pub fn towards(from: (f32, f32), to: (f32, f32), by: f32) -> (f32, f32) {
     let length = distance(from, to).max(0.001);
     (from.0 + (to.0 - from.0) * by / length, from.1 + (to.1 - from.1) * by / length)
 }

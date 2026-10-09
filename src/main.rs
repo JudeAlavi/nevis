@@ -2,6 +2,7 @@
 
 mod anchors;
 mod attachments;
+mod classes;
 mod backlinks;
 mod color;
 mod complete;
