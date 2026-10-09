@@ -204,11 +204,18 @@ impl Styler {
         }
         let editing = self.editing_lines();
         self.editing.set(editing);
-        let (want, marks) = match (&*self.styled.borrow(), editing) {
+        let (want, marks, blocks) = match (&*self.styled.borrow(), editing) {
             (Some((text, spans)), Some((first, last))) if self.live.get() && self.enabled.get() => {
-                (hidden(text, spans, first..=last), drawn(text, spans, first..=last))
+                let blocks = blocks(text, spans, first..=last);
+                // Each block's source, for the paper to draw it from.
+                let bytes: Vec<usize> = if blocks.is_empty() { Vec::new() } else { text.char_indices().map(|(i, _)| i).chain([text.len()]).collect() };
+                let blocks = blocks.into_iter().map(|(range, block)| {
+                    let source = text[bytes[range.start]..bytes[range.end]].to_owned();
+                    (range, block, source)
+                });
+                (hidden(text, spans, first..=last), drawn(text, spans, first..=last), blocks.collect())
             }
-            _ => (Vec::new(), Vec::new()),
+            _ => (Vec::new(), Vec::new(), Vec::new()),
         };
         self.retag(&self.hide, &want);
         // Under a drawing the text stays, unseen (a title's line is hidden instead).
@@ -216,6 +223,7 @@ impl Styler {
         self.retag(&self.clear, &under);
         if let Some(paper) = &*self.paper.borrow() {
             paper.set_marks(marks);
+            paper.set_blocks(blocks);
         }
     }
 
@@ -278,9 +286,12 @@ impl Styler {
                 fresh.is_paragraph_background_set().then(|| fresh.paragraph_background_rgba()).flatten().as_ref(),
             );
         }
-        // Code takes the new scheme's colours.
+        // Code takes the new scheme's colours, and so do the blocks Live Preview draws.
         self.uncolour();
         self.colours.borrow_mut().clear();
+        if let Some(paper) = &*self.paper.borrow() {
+            paper.forget_drawings();
+        }
         if self.enabled.get() {
             self.restyle();
         }
@@ -564,7 +575,7 @@ fn subtract(a: &[Range<usize>], b: &[Range<usize>]) -> Vec<Range<usize>> {
 /// that name a language, to colour as that language.
 #[derive(Debug, Default)]
 #[derive(Clone)]
-pub struct Spans([Vec<Range<usize>>; KINDS], Vec<Fence>, Vec<Range<usize>>);
+pub struct Spans([Vec<Range<usize>>; KINDS], Vec<Fence>, Vec<Range<usize>>, Vec<(Range<usize>, Block)>);
 
 /// A fenced code block's language, and the character ranges its code is in: one, or a piece
 /// per line inside a quote or a list (their markers aren't code).
@@ -719,6 +730,27 @@ fn callout_header(chars: &[char], quote: &Range<usize>) -> Option<(Range<usize>,
     obsidian::callout(&line).map(|callout| (start..end, callout))
 }
 
+/// The blocks Live Preview shows drawn rather than written, away from the lines `editing`:
+/// tables, formulas and pictures with lines to themselves, and Mermaid flowcharts. Character
+/// ranges of whole lines (without the last one's end).
+pub fn blocks(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<usize>) -> Vec<(Range<usize>, Block)> {
+    let chars: Vec<char> = source.chars().collect();
+    let edited = lines(&chars, &editing);
+    spans.3.iter().filter(|(range, _)| !overlap(range, &edited)).cloned().collect()
+}
+
+/// A block Live Preview may draw (see `blocks`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Block {
+    Table,
+    /// `$$…$$`.
+    Math,
+    /// A Mermaid flowchart's fenced block.
+    Chart,
+    /// `![…](…)` or `![[…]]`.
+    Image,
+}
+
 /// Something Live Preview draws (see `drawn`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mark {
@@ -749,6 +781,9 @@ pub fn spans(source: &str) -> Spans {
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
                 // "rust", "py title", "rust,ignore", "{.python}".
                 let language = info.split([' ', '\t', ',']).next().unwrap_or_default().trim_matches(['{', '}', '.']);
+                if language == "mermaid" {
+                    out.block(source, range.clone(), Block::Chart);
+                }
                 fence = (!language.is_empty()).then(|| (language.to_owned(), Vec::new()));
             }
             Event::Text(_) => {
@@ -777,7 +812,11 @@ pub fn spans(source: &str) -> Spans {
             });
         }
         match event {
-            Event::Start(Tag::Link { .. } | Tag::Image { .. }) => links.push((range, None)),
+            Event::Start(Tag::Image { .. }) => {
+                out.block(source, range.clone(), Block::Image);
+                links.push((range, None));
+            }
+            Event::Start(Tag::Link { .. }) => links.push((range, None)),
             Event::Start(Tag::Heading { level, .. }) => heading(source, range, level, &mut out),
             Event::Start(Tag::Strong) => wrapped(Kind::Strong, range, 2, &mut out),
             Event::Start(Tag::Emphasis) => wrapped(Kind::Emphasis, range, 1, &mut out),
@@ -795,6 +834,7 @@ pub fn spans(source: &str) -> Spans {
             }
             Event::DisplayMath(_) => {
                 out.keep(range.clone());
+                out.block(source, range.clone(), Block::Math);
                 wrapped(Kind::Code, range, 2, &mut out);
             }
             Event::Start(Tag::CodeBlock(kind)) => code_block(source, range, kind.is_fenced(), &mut out),
@@ -802,6 +842,7 @@ pub fn spans(source: &str) -> Spans {
             Event::Start(Tag::BlockQuote(_)) => quote(source, range, &mut out),
             Event::Start(Tag::Table(_)) => {
                 out.keep(range.clone());
+                out.block(source, range.clone(), Block::Table);
                 table(source, range, &mut out);
             }
             Event::Start(Tag::TableHead) => out.push(Kind::Strong, without_newline(source, range)),
@@ -994,6 +1035,8 @@ struct Collector {
     fences: Vec<(String, Vec<Range<usize>>)>,
     /// Tables, math and rules (byte ranges): left as written in Live Preview.
     written: Vec<Range<usize>>,
+    /// Blocks Live Preview may draw: whole lines (byte ranges).
+    blocks: Vec<(Range<usize>, Block)>,
 }
 
 impl Collector {
@@ -1005,6 +1048,17 @@ impl Collector {
 
     fn keep(&mut self, range: Range<usize>) {
         self.written.push(range);
+    }
+
+    /// `range` as a block Live Preview may draw, if it has its lines to itself: nothing
+    /// beside it, not in a quote or a list.
+    fn block(&mut self, source: &str, range: Range<usize>, kind: Block) {
+        let range = without_newline(source, range);
+        let start = source[..range.start].rfind('\n').map_or(0, |i| i + 1);
+        let end = source[range.end..].find('\n').map_or(source.len(), |i| range.end + i);
+        if source[start..range.start].trim().is_empty() && source[range.end..end].trim().is_empty() {
+            self.blocks.push((start..end, kind));
+        }
     }
 
     /// Character ranges, sorted, with overlapping or touching ones merged.
@@ -1029,7 +1083,8 @@ impl Collector {
             merged
         });
         let written = self.written.into_iter().map(|r| char_at(r.start)..char_at(r.end)).collect();
-        Spans(ranges, fences, written)
+        let blocks = self.blocks.into_iter().map(|(r, block)| (char_at(r.start)..char_at(r.end), block)).collect();
+        Spans(ranges, fences, written, blocks)
     }
 }
 
@@ -1225,6 +1280,24 @@ mod tests {
             vec![(2..5, Mark::Task(false)), (19..19, Mark::Title("Title".into(), "tip")), (42..42, Mark::Title("Note".into(), "note"))]
         );
         assert_eq!(panels(text, &s), vec![(17..38, Some("tip")), (40..65, Some("note")), (67..74, None)]);
+    }
+
+    #[test]
+    fn live_preview_draws_tables_pictures_flowcharts_and_formulas_with_lines_to_themselves() {
+        let text = "Text\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n![[pic.png|300]]\n\nSee ![x](inline.png) here.\n\n$$\nx^2\n$$\n\n```mermaid\ngraph TD\nA-->B\n```\n\n> | q |\n> |---|\n";
+        let s = spans(text);
+        let drawn = |editing| blocks(text, &s, editing).into_iter().map(|(range, block)| (&text[range], block)).collect::<Vec<_>>();
+        assert_eq!(
+            drawn(0..=0),
+            vec![
+                ("| a | b |\n|---|---|\n| 1 | 2 |", Block::Table),
+                ("![[pic.png|300]]", Block::Image),
+                ("$$\nx^2\n$$", Block::Math),
+                ("```mermaid\ngraph TD\nA-->B\n```", Block::Chart),
+            ]
+        );
+        // With the cursor in it, the table is written out.
+        assert_eq!(drawn(3..=3).len(), 3);
     }
 
     #[test]

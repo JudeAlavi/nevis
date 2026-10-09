@@ -225,16 +225,18 @@ struct List {
 }
 
 /// A table being collected.
-struct Table {
-    aligns: Vec<Alignment>,
-    rows: Vec<(bool, Vec<Cell>)>,
+pub struct Table {
+    pub aligns: Vec<Alignment>,
+    /// Each row: whether it is the header, and its cells.
+    pub rows: Vec<(bool, Vec<Cell>)>,
     head: bool,
 }
 
 #[derive(Default)]
-struct Cell {
-    markup: String,
-    plain: String,
+pub struct Cell {
+    /// The cell's text as Pango markup, and as plain text.
+    pub markup: String,
+    pub plain: String,
 }
 
 struct Renderer<'m> {
@@ -305,6 +307,8 @@ struct Renderer<'m> {
     scripts: HashMap<(i8, u8), gtk::TextTag>,
     /// The source of the Mermaid block being read, kept aside to draw at its end.
     mermaid: Option<String>,
+    /// Tables kept as they are (for Live Preview to draw), not made into widgets.
+    tables: Option<Vec<Table>>,
 }
 
 impl<'m> Renderer<'m> {
@@ -358,6 +362,7 @@ impl<'m> Renderer<'m> {
             children: Vec::new(),
             scripts: HashMap::new(),
             mermaid: None,
+            tables: None,
         }
     }
 
@@ -631,6 +636,9 @@ impl<'m> Renderer<'m> {
             }
             TagEnd::Table => {
                 if let Some(table) = self.table.take() {
+                    if let Some(tables) = &mut self.tables {
+                        return tables.push(table);
+                    }
                     let grid = table_widget(table);
                     let anchor = self.anchor();
                     self.children.push((anchor, grid));
@@ -928,19 +936,8 @@ impl<'m> Renderer<'m> {
     fn math(&mut self, latex: &str, display: bool) {
         let runs = math::runs(latex);
         if let Some(cell) = self.cell() {
-            cell.markup.push_str(&format!("<span font_family=\"{}\">", fonts::MATH));
-            for run in &runs {
-                let script = match run.rise {
-                    rise if rise > 0 => "sup",
-                    rise if rise < 0 => "sub",
-                    _ => "small",
-                };
-                let depth = usize::from(run.depth);
-                let text = glib::markup_escape_text(&run.text.replace('\n', "; "));
-                cell.markup.push_str(&format!("{}{text}{}", format!("<{script}>").repeat(depth), format!("</{script}>").repeat(depth)));
-                cell.plain.push_str(&run.text);
-            }
-            cell.markup.push_str("</span>");
+            cell.markup.push_str(&math_markup(latex, true));
+            cell.plain.extend(runs.iter().map(|run| run.text.as_str()));
             return;
         }
         if display {
@@ -1042,15 +1039,7 @@ impl<'m> Renderer<'m> {
                 .unwrap_or_else(|| gio::File::for_path(&path))
         };
         let texture = local.then(file).and_then(|file| gdk::Texture::from_file(&file).ok());
-        // Obsidian's sizes: ![[pic.png|300]] (the text after | comes as the alt) and
-        // ![caption|300x200](pic.png).
-        let (alt, size) = match alt.rsplit_once('|') {
-            Some((caption, size)) if picture_size(size).is_some() => (caption, picture_size(size)),
-            _ => match picture_size(alt) {
-                Some(size) => ("", Some(size)),
-                None => (alt, None),
-            },
-        };
+        let (alt, _) = caption_and_size(alt);
         let Some(texture) = texture else {
             // Remote or unreadable: show the alt text as a link instead.
             let label = if alt.is_empty() { url } else { alt };
@@ -1060,14 +1049,7 @@ impl<'m> Renderer<'m> {
             self.styled(&format!("[image: {label}]"), tag, "", "");
             return;
         };
-        // Shown at most 720 px wide unless a size is given, keeping the aspect ratio unless
-        // both sides are.
-        let (w, h) = (texture.width().max(1), texture.height().max(1));
-        let (width, height) = match size {
-            Some((width, Some(height))) => (width, height),
-            Some((width, None)) => (width, h * width / w),
-            None => (w.min(720), h * w.min(720) / w),
-        };
+        let (width, height) = picture_box(&texture, caption_and_size(alt).1);
         let picture = gtk::Picture::for_paintable(&texture);
         picture.set_can_shrink(true);
         picture.set_size_request(width, height);
@@ -1369,6 +1351,79 @@ pub fn callout_color(kind: &str) -> crate::color::Rgb {
     }
 }
 
+/// Obsidian's sizes: `![[pic.png|300]]` (the text after `|` comes as the alt) and
+/// `![caption|300x200](pic.png)`: the caption, and the size if one is given.
+fn caption_and_size(alt: &str) -> (&str, Option<(i32, Option<i32>)>) {
+    match alt.rsplit_once('|') {
+        Some((caption, size)) if picture_size(size).is_some() => (caption, picture_size(size)),
+        _ => match picture_size(alt) {
+            Some(size) => ("", Some(size)),
+            None => (alt, None),
+        },
+    }
+}
+
+/// How big a picture is shown: at most 720 px wide unless a size is given, keeping the aspect
+/// ratio unless both sides are.
+fn picture_box(texture: &gdk::Texture, size: Option<(i32, Option<i32>)>) -> (i32, i32) {
+    let (w, h) = (texture.width().max(1), texture.height().max(1));
+    match size {
+        Some((width, Some(height))) => (width, height),
+        Some((width, None)) => (width, h * width / w),
+        None => (w.min(720), h * w.min(720) / w),
+    }
+}
+
+/// The picture `source` (`![…](…)` or `![[…]]`) shows, found as the rendered view finds it, and
+/// how big: for Live Preview. Nothing for one on the web or not there.
+pub fn picture(source: &str, find: &dyn Fn(&str) -> Option<gio::File>) -> Option<(gdk::Texture, i32, i32)> {
+    let mut url = None;
+    let mut alt = String::new();
+    for (event, _) in events(source) {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) => url = Some(dest_url.to_string()),
+            Event::Text(text) if url.is_some() => alt.push_str(&text),
+            Event::End(TagEnd::Image) => break,
+            _ => {}
+        }
+    }
+    let url = url.filter(|url| !links::has_scheme(url))?;
+    let texture = gdk::Texture::from_file(&find(&links::decode(&url))?).ok()?;
+    let (width, height) = picture_box(&texture, caption_and_size(&alt).1);
+    Some((texture, width, height))
+}
+
+/// The table `source` is, its cells as the rendered view writes them: for Live Preview.
+pub fn table(source: &str, find: &dyn Fn(&str) -> Option<gio::File>, text: &dyn Fn(&str) -> pango::Layout) -> Option<Table> {
+    let mut r = Renderer::new(None, find, sourceview::Buffer::new(None), text, 0);
+    r.tables = Some(Vec::new());
+    let (shown, additions) = prepare(source);
+    r.read(&shown, additions);
+    for (event, range) in events(&shown) {
+        r.event(event, range);
+    }
+    r.tables?.into_iter().next()
+}
+
+/// A formula (what is between the dollar signs) as Pango markup: its runs raised or lowered,
+/// smaller in scripts; on `one_line`, its lines joined by semicolons.
+pub fn math_markup(latex: &str, one_line: bool) -> String {
+    let mut markup = format!("<span font_family=\"{}\">", fonts::MATH);
+    for run in math::runs(latex) {
+        let script = match run.rise {
+            rise if rise > 0 => "sup",
+            rise if rise < 0 => "sub",
+            _ => "small",
+        };
+        let depth = usize::from(run.depth);
+        let text = if one_line { run.text.replace('\n', "; ") } else { run.text };
+        let text = glib::markup_escape_text(&text);
+        markup.push_str(&format!("{}{text}{}", format!("<{script}>").repeat(depth), format!("</{script}>").repeat(depth)));
+    }
+    markup.push_str("</span>");
+    markup
+}
+
 /// An Obsidian picture size: "300" (the width) or "300x200".
 fn picture_size(text: &str) -> Option<(i32, Option<i32>)> {
     let number = |text: &str| text.trim().parse::<i32>().ok().filter(|&n| n > 0 && n <= 4000);
@@ -1383,7 +1438,7 @@ fn heading_index(level: HeadingLevel) -> usize {
 }
 
 /// Width in columns: CJK and other full-width characters count twice.
-fn display_width(text: &str) -> usize {
+pub fn display_width(text: &str) -> usize {
     text.chars()
         .map(|c| match c as u32 {
             0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F

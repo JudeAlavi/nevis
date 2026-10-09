@@ -28,6 +28,8 @@ pub mod fonts {
     pub const MONO: &str = "JetBrains Mono, Vazirmatn";
     /// Formulas: fonts that have the mathematical italic letters (𝑥) and the symbols.
     pub const MATH: &str = "DejaVu Math TeX Gyre, Noto Sans Math, DejaVu Serif, serif";
+    /// The rendered view's text (also what Live Preview draws tables in).
+    pub const BODY: &str = "Inter Variable, Inter, Vazirmatn, sans-serif";
 }
 
 thread_local! {

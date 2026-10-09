@@ -515,6 +515,9 @@ impl Editor {
             }
         });
         self.view.add_controller(pointer);
+        // Live Preview draws pictures found as the rendered view finds them.
+        let weak = Rc::downgrade(self);
+        self.view.find_with(move |path| weak.upgrade()?.find(path));
         self.styler.set_live(settings::get().live_preview);
         let focus = gtk::EventControllerFocus::new();
         let weak = Rc::downgrade(self);
