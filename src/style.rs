@@ -274,7 +274,7 @@ impl Styler {
             .into_iter()
             .map(|(range, kind)| {
                 let (start, end) = (self.iter_at(range.start), self.iter_at(range.end));
-                let rtl = pango::find_base_dir(&self.buffer.text(&start, &end, false)) == pango::Direction::Rtl;
+                let rtl = pango::find_base_dir(&self.buffer.text(&start, &end, true)) == pango::Direction::Rtl;
                 render::Panel {
                     start: self.buffer.create_mark(None, &start, true),
                     end: self.buffer.create_mark(None, &end, false),
@@ -350,7 +350,7 @@ impl Styler {
     /// re-tagging the whole text would make GTK lay all of it out again.
     fn restyle(&self) {
         let started = Instant::now();
-        let text = self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), false);
+        let text = self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), true);
         if text.len() > MAX_STYLED_BYTES {
             return self.clear();
         }
@@ -408,7 +408,7 @@ impl Styler {
                 let code = fence
                     .pieces
                     .iter()
-                    .map(|p| self.buffer.text(&self.iter_at(p.start), &self.iter_at(p.end), false).to_string())
+                    .map(|p| self.buffer.text(&self.iter_at(p.start), &self.iter_at(p.end), true).to_string())
                     .collect();
                 (fence.language.clone(), code)
             })

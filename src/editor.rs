@@ -643,8 +643,8 @@ impl Editor {
         if !end.ends_line() {
             end.forward_to_line_end();
         }
-        let before = self.buffer.text(&start, &cursor, false);
-        let after = self.buffer.text(&cursor, &end, false);
+        let before = self.buffer.text(&start, &cursor, true);
+        let after = self.buffer.text(&cursor, &end, true);
         let Some(enter) = lists::on_enter(&before, &after) else { return false };
         self.buffer.begin_user_action();
         match enter {
@@ -1389,7 +1389,7 @@ impl Editor {
             let start = self.buffer.start_iter();
             let mut end = start;
             end.forward_chars(1024);
-            let head = self.buffer.text(&start, &end, false);
+            let head = self.buffer.text(&start, &end, true);
             let name = location.basename();
             let (kind, _) = gio::content_type_guess(name.as_deref(), head.as_bytes());
             sourceview::LanguageManager::default().guess_language(name.as_deref(), Some(&kind))
@@ -1434,7 +1434,7 @@ impl Editor {
     /// The selected words become a link to `address`: [words](address).
     fn link_selection(&self, address: &str) {
         let Some((mut start, mut end)) = self.buffer.selection_bounds() else { return };
-        let words = self.buffer.text(&start, &end, false);
+        let words = self.buffer.text(&start, &end, true);
         self.buffer.begin_user_action();
         self.buffer.delete(&mut start, &mut end);
         self.buffer.insert(&mut start, &format!("[{words}]({address})"));
@@ -1451,7 +1451,7 @@ impl Editor {
         self.buffer.begin_user_action();
         let (words, address) = match self.buffer.selection_bounds() {
             Some((mut start, mut end)) => {
-                let selected = self.buffer.text(&start, &end, false).to_string();
+                let selected = self.buffer.text(&start, &end, true).to_string();
                 self.buffer.delete(&mut start, &mut end);
                 match selected.trim() {
                     address if links::is_web_address(address) => (String::new(), address.to_owned()),
@@ -1667,7 +1667,7 @@ impl Editor {
             let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
             let mut line = cursor;
             line.set_line_offset(0);
-            let (context, back) = complete::context(&self.buffer.text(&line, &cursor, false))?;
+            let (context, back) = complete::context(&self.buffer.text(&line, &cursor, true))?;
             let start = cursor.offset() - back as i32;
             if self.dismissed.get() == Some(start) {
                 return None;
@@ -1812,13 +1812,13 @@ impl Editor {
         let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
         let mut line = cursor;
         line.set_line_offset(0);
-        let Some((context, back)) = complete::context(&self.buffer.text(&line, &cursor, false)) else { return false };
+        let Some((context, back)) = complete::context(&self.buffer.text(&line, &cursor, true)) else { return false };
         let mut start = cursor;
         start.backward_chars(back as i32);
         let mut end = cursor;
         let mut ahead = cursor;
         ahead.forward_chars(2);
-        let closed = self.buffer.text(&cursor, &ahead, false) == "]]";
+        let closed = self.buffer.text(&cursor, &ahead, true) == "]]";
         let link = matches!(context, Context::Link(_) | Context::Heading(..));
         self.buffer.begin_user_action();
         self.buffer.delete(&mut start, &mut end);
@@ -1841,7 +1841,7 @@ impl Editor {
         let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
         let mut line = cursor;
         line.set_line_offset(0);
-        if let Some((_, back)) = complete::context(&self.buffer.text(&line, &cursor, false)) {
+        if let Some((_, back)) = complete::context(&self.buffer.text(&line, &cursor, true)) {
             self.dismissed.set(Some(cursor.offset() - back as i32));
         }
         if let Some(completion) = self.completion.borrow().as_ref() {
@@ -1914,8 +1914,10 @@ impl Editor {
         }
     }
 
+    /// The note's text, all of it: with what Live Preview hides. (GTK leaves invisible text
+    /// out unless asked; every read of a buffer here asks.)
     pub fn text(&self) -> String {
-        self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), false).to_string()
+        self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), true).to_string()
     }
 
     /// The file's name; for a note not saved yet, its first line.
@@ -1932,7 +1934,7 @@ impl Editor {
         let text = draft.unwrap_or_else(|| {
             let mut end = self.buffer.start_iter();
             end.forward_lines(6);
-            self.buffer.text(&self.buffer.start_iter(), &end, false).to_string()
+            self.buffer.text(&self.buffer.start_iter(), &end, true).to_string()
         });
         names::of_text(&text)
     }

@@ -1163,7 +1163,7 @@ impl<'m> Renderer<'m> {
         let panel = &mut self.panels[open.panel];
         panel.end = self.buffer.create_mark(None, &end, true);
         let start = self.buffer.iter_at_mark(&panel.start);
-        panel.rtl = pango::find_base_dir(&self.buffer.text(&start, &end, false)) == pango::Direction::Rtl;
+        panel.rtl = pango::find_base_dir(&self.buffer.text(&start, &end, true)) == pango::Direction::Rtl;
         Some(open)
     }
 
@@ -1262,7 +1262,7 @@ impl<'m> Renderer<'m> {
             let Some(((left, depth, hang), tag)) = ltr.iter().find(|(_, tag)| start.has_tag(tag)) else { continue };
             let mut end = start;
             end.forward_to_line_end();
-            if pango::find_base_dir(&self.buffer.text(&start, &end, false)) == pango::Direction::Rtl {
+            if pango::find_base_dir(&self.buffer.text(&start, &end, true)) == pango::Direction::Rtl {
                 let rtl = self.indent(*left, *depth, *hang, true);
                 self.buffer.remove_tag(tag, &start, &end);
                 self.buffer.apply_tag(&rtl, &start, &end);
@@ -1278,7 +1278,7 @@ pub fn highlight_code(buffer: &sourceview::Buffer, blocks: &[CodeBlock], scheme:
     let mut colours: HashMap<String, gtk::TextTag> = HashMap::new();
     for block in blocks {
         let start = buffer.iter_at_mark(&block.start);
-        let code = buffer.text(&start, &buffer.iter_at_mark(&block.end), false);
+        let code = buffer.text(&start, &buffer.iter_at_mark(&block.end), true);
         let base = start.offset() as usize;
         for (range, colour) in code_colours(&block.language, &code, scheme) {
             let tag = colours.entry(colour.to_string()).or_insert_with(|| {

@@ -141,7 +141,7 @@ impl FindBar {
     /// Opens the bar, prefilled with the selected text when it is a single line.
     pub fn show(&self, with_replace: bool) {
         if let Some((start, end)) = self.buffer.selection_bounds() {
-            let text = self.buffer.text(&start, &end, false);
+            let text = self.buffer.text(&start, &end, true);
             if !text.is_empty() && !text.contains('\n') {
                 self.entry.set_text(&text);
             }
