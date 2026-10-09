@@ -118,8 +118,11 @@ impl Styler {
             .collect();
         let hide = gtk::TextTag::builder().invisible(true).build();
         table.add(&hide);
-        // Not quite 0: Pango takes an alpha of 0 as none given, and draws the text opaque.
-        let clear = gtk::TextTag::builder().foreground_rgba(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.001)).build();
+        // Not quite 0: Pango takes an alpha of 0 as none given, and draws the text (or its
+        // background) opaque. No background (a formula's code background would show round its
+        // drawing).
+        let unseen = gdk::RGBA::new(0.0, 0.0, 0.0, 0.001);
+        let clear = gtk::TextTag::builder().foreground_rgba(&unseen).background_rgba(&unseen).build();
         table.add(&clear);
         let styler = Rc::new(Self {
             buffer: buffer.clone(),
@@ -620,7 +623,18 @@ fn subtract(a: &[Range<usize>], b: &[Range<usize>]) -> Vec<Range<usize>> {
 /// that name a language, to colour as that language.
 #[derive(Debug, Default)]
 #[derive(Clone)]
-pub struct Spans([Vec<Range<usize>>; KINDS], Vec<Fence>, Vec<Range<usize>>, Vec<(Range<usize>, Block)>, Vec<Range<usize>>);
+pub struct Spans {
+    /// Character ranges by kind, in `Kind` order.
+    kinds: [Vec<Range<usize>>; KINDS],
+    fences: Vec<Fence>,
+    /// Tables, math and rules: left as written by the hiding (see `as_written`).
+    written: Vec<Range<usize>>,
+    /// Blocks Live Preview may draw (see `blocks`), pictures beside other things (see
+    /// `pictures`), and formulas in lines with other things (see `drawn`).
+    blocks: Vec<(Range<usize>, Block)>,
+    pictures: Vec<Range<usize>>,
+    formulas: Vec<(Range<usize>, String)>,
+}
 
 /// A fenced code block's language, and the character ranges its code is in: one, or a piece
 /// per line inside a quote or a list (their markers aren't code).
@@ -632,16 +646,16 @@ pub struct Fence {
 
 impl Spans {
     pub fn of(&self, kind: Kind) -> &[Range<usize>] {
-        &self.0[kind as usize]
+        &self.kinds[kind as usize]
     }
 
     pub fn fences(&self) -> &[Fence] {
-        &self.1
+        &self.fences
     }
 
     /// Tables, math and rules: markup that Live Preview leaves as written.
     pub fn as_written(&self) -> &[Range<usize>] {
-        &self.2
+        &self.written
     }
 }
 
@@ -727,6 +741,12 @@ pub fn drawn(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<usiz
             marks.push((header.start..header.start, Mark::Title(callout.title, callout.kind)));
         }
     }
+    // Formulas, but those in a table: the table is drawn whole.
+    for (range, latex) in &spans.formulas {
+        if !spans.blocks.iter().any(|(block, _)| overlap(block, range)) {
+            marks.push((range.clone(), Mark::Math(latex.clone())));
+        }
+    }
     marks.retain(|(range, _)| {
         // A title is drawn over its hidden line: whether that is edited counts.
         let line = range.start..range.end.max(range.start + 1);
@@ -781,7 +801,7 @@ fn callout_header(chars: &[char], quote: &Range<usize>) -> Option<(Range<usize>,
 pub fn blocks(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<usize>) -> Vec<(Range<usize>, Block)> {
     let chars: Vec<char> = source.chars().collect();
     let edited = lines(&chars, &editing);
-    spans.3.iter().filter(|(range, _)| !overlap(range, &edited)).cloned().collect()
+    spans.blocks.iter().filter(|(range, _)| !overlap(range, &edited)).cloned().collect()
 }
 
 /// The pictures in lines that have other things in them too (a sentence, a list item), away
@@ -791,9 +811,9 @@ pub fn pictures(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<u
     let chars: Vec<char> = source.chars().collect();
     let edited = lines(&chars, &editing);
     let mut found: Vec<(Range<usize>, Vec<Range<usize>>)> = Vec::new();
-    for picture in &spans.4 {
+    for picture in &spans.pictures {
         // A table draws its own.
-        if spans.3.iter().any(|(block, _)| overlap(block, picture)) {
+        if spans.blocks.iter().any(|(block, _)| overlap(block, picture)) {
             continue;
         }
         let start = chars[..picture.start].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
@@ -855,6 +875,8 @@ pub enum Mark {
     Rule,
     /// A callout's first line: its title, in its kind's colour.
     Title(String, &'static str),
+    /// A formula (`$…$`): drawn as the rendered view writes it (what is between the dollars).
+    Math(String),
 }
 
 /// Works out how each part of `source` should look.
@@ -927,13 +949,17 @@ pub fn spans(source: &str) -> Spans {
                 let ticks = source[range.clone()].bytes().take_while(|&b| b == b'`').count();
                 wrapped(Kind::Code, range, ticks, &mut out);
             }
-            Event::InlineMath(_) => {
+            Event::InlineMath(latex) => {
                 out.keep(range.clone());
+                out.formulas.push((range.clone(), latex.to_string()));
                 wrapped(Kind::Code, range, 1, &mut out);
             }
-            Event::DisplayMath(_) => {
+            Event::DisplayMath(latex) => {
                 out.keep(range.clone());
-                out.block(source, range.clone(), Block::Math);
+                // On lines of its own it is a block; in a sentence, drawn in the line.
+                if !out.block(source, range.clone(), Block::Math) {
+                    out.formulas.push((range.clone(), latex.to_string()));
+                }
                 wrapped(Kind::Code, range, 2, &mut out);
             }
             Event::Start(Tag::CodeBlock(kind)) => code_block(source, range, kind.is_fenced(), &mut out),
@@ -1154,6 +1180,8 @@ struct Collector {
     blocks: Vec<(Range<usize>, Block)>,
     /// Pictures sharing their line with other things (byte ranges).
     pictures: Vec<Range<usize>>,
+    /// Formulas in lines with other things, and what is between their dollars (byte ranges).
+    formulas: Vec<(Range<usize>, String)>,
 }
 
 impl Collector {
@@ -1204,7 +1232,8 @@ impl Collector {
         let written = self.written.into_iter().map(|r| char_at(r.start)..char_at(r.end)).collect();
         let blocks = self.blocks.into_iter().map(|(r, block)| (char_at(r.start)..char_at(r.end), block)).collect();
         let pictures = self.pictures.into_iter().map(|r| char_at(r.start)..char_at(r.end)).collect();
-        Spans(ranges, fences, written, blocks, pictures)
+        let formulas = self.formulas.into_iter().map(|(r, latex)| (char_at(r.start)..char_at(r.end), latex)).collect();
+        Spans { kinds: ranges, fences, written, blocks, pictures, formulas }
     }
 }
 
@@ -1462,6 +1491,27 @@ mod tests {
         let s = spans("![[pic.png|300]] ![[shot.png|300x200]] ![[Note|alias]]");
         assert_eq!(s.of(Kind::LinkText), &[3..10, 20..28, 47..52]);
         assert_eq!(s.of(Kind::Url), &[10..16, 28..38, 52..54]);
+    }
+
+    #[test]
+    fn live_preview_draws_formulas_in_a_line_away_from_the_cursor() {
+        let text = "Area $\\pi r^2$ and $$x_1$$ here.\n\n$$\ny\n$$\n\n`$code$` and $z$";
+        let s = spans(text);
+        let formulas = |editing| {
+            drawn(text, &s, editing)
+                .into_iter()
+                .filter_map(|(range, mark)| match mark {
+                    Mark::Math(latex) => Some((&text[range], latex)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            formulas(99..=99),
+            vec![("$\\pi r^2$", "\\pi r^2".to_owned()), ("$$x_1$$", "x_1".to_owned()), ("$z$", "z".to_owned())]
+        );
+        // The line being edited shows its formulas written.
+        assert_eq!(formulas(0..=0).len(), 1);
     }
 
     #[test]

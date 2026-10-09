@@ -52,6 +52,11 @@ mod imp {
         pub finder: RefCell<Option<Finder>>,
         /// Callout titles as Pango markup, by their Markdown.
         pub titles: RefCell<HashMap<String, String>>,
+        /// Formulas laid out, by their LaTeX and the text size; the tag hiding what their
+        /// drawing doesn't need of their source, and where it is now.
+        pub formulas: RefCell<HashMap<(String, i32), pango::Layout>>,
+        pub squeeze: RefCell<Option<gtk::TextTag>>,
+        pub squeezed: RefCell<Vec<Range<usize>>>,
         /// The width and text size blocks were last placed for.
         pub width: Cell<i32>,
         pub size: Cell<i32>,
@@ -93,12 +98,14 @@ mod imp {
                 super::draw_marks(&self.obj(), &self.marks.borrow(), &snapshot);
                 // The text size changed: blocks drawn again at the new size, once this is drawn.
                 let size = self.obj().pango_context().font_description().map_or(0, |font| font.size());
-                if size != self.size.get() && self.obj().has_blocks() {
+                let formulas = self.marks.borrow().iter().any(|(_, mark)| matches!(mark, Mark::Math(_)));
+                if size != self.size.get() && (self.obj().has_blocks() || formulas) {
                     self.size.set(size);
                     let paper = self.obj().downgrade();
                     glib::idle_add_local_once(move || {
                         if let Some(paper) = paper.upgrade() {
                             paper.place_blocks();
+                            paper.squeeze_formulas();
                         }
                     });
                 }
@@ -134,11 +141,78 @@ impl Paper {
 
     /// Draws `marks` (sorted character ranges of the buffer shown now) over the text.
     pub fn set_marks(&self, marks: Vec<(Range<usize>, Mark)>) {
-        let mut have = self.imp().marks.borrow_mut();
-        if *have != marks {
+        let changed = {
+            let mut have = self.imp().marks.borrow_mut();
+            let changed = *have != marks;
             *have = marks;
+            changed
+        };
+        if changed {
+            self.squeeze_formulas();
             self.queue_draw();
         }
+    }
+
+    /// How much bigger than the body's a formula at `start` is drawn: as its line's characters
+    /// are (a heading's are bigger).
+    fn formula_scale(&self, start: &gtk::TextIter) -> f32 {
+        let body = self.create_pango_layout(Some("X")).pixel_size().1.max(1) as f32;
+        (place(self, start).height() as f32 / body).max(1.0)
+    }
+
+    /// A formula laid out as the rendered view writes it, at this view's text size (once).
+    fn formula(&self, latex: &str) -> pango::Layout {
+        let size = self.pango_context().font_description().map_or(0, |font| font.size());
+        let key = (latex.to_owned(), size);
+        if let Some(layout) = self.imp().formulas.borrow().get(&key) {
+            return layout.clone();
+        }
+        let layout = self.create_pango_layout(None);
+        layout.set_markup(&render::math_markup(latex, true));
+        self.imp().formulas.borrow_mut().insert(key, layout.clone());
+        layout
+    }
+
+    /// Of each formula drawn, keeps only as many characters of its source as the drawing is
+    /// wide (the rest hidden), so its line closes up round it. Measured on the line itself, so
+    /// a heading's bigger characters count as such.
+    fn squeeze_formulas(&self) {
+        let buffer = self.buffer();
+        let mut want = Vec::new();
+        for (range, mark) in self.imp().marks.borrow().iter() {
+            let Mark::Math(latex) = mark else { continue };
+            let start = buffer.iter_at_offset(range.start as i32);
+            let mut second = start;
+            second.forward_char();
+            let (_, character) = span(self, &start, &second);
+            if character < 1.0 {
+                continue;
+            }
+            let wide = self.formula(latex).pixel_size().0 as f32 * self.formula_scale(&start) + 2.0;
+            let keep = ((wide / character).ceil() as usize).max(1);
+            if keep < range.len() {
+                want.push(range.start + keep..range.end);
+            }
+        }
+        if *self.imp().squeezed.borrow() == want {
+            return;
+        }
+        let tag = self
+            .imp()
+            .squeeze
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                let tag = gtk::TextTag::builder().invisible(true).build();
+                buffer.tag_table().add(&tag);
+                tag
+            })
+            .clone();
+        let (start, end) = buffer.bounds();
+        buffer.remove_tag(&tag, &start, &end);
+        for range in &want {
+            buffer.apply_tag(&tag, &buffer.iter_at_offset(range.start as i32), &buffer.iter_at_offset(range.end as i32));
+        }
+        *self.imp().squeezed.borrow_mut() = want;
     }
 
     /// Finds the files pictures name with `finder`.
@@ -688,6 +762,21 @@ fn draw_marks(view: &Paper, marks: &[(Range<usize>, Mark)], snapshot: &gtk::Snap
                 let right = (seen.x() + seen.width() - view.right_margin()) as f32;
                 let line = graphene::Rect::new(left, (y + height / 2.0).round(), right - left, 1.0);
                 snapshot.append_color(&render::rgba(colors.rule, 1.0), &line);
+            }
+            Mark::Math(latex) => {
+                // Over what is kept of its source: as wide as it is, or shrunk to fit.
+                let layout = view.formula(latex);
+                let (left, kept) = span(view, &start, &buffer.iter_at_offset(range.end as i32));
+                let (wide, tall) = layout.pixel_size();
+                let mut scale = view.formula_scale(&start);
+                if wide as f32 * scale > kept && kept > 0.0 {
+                    scale = kept / wide as f32;
+                }
+                snapshot.save();
+                snapshot.translate(&graphene::Point::new(left, y + (height - tall as f32 * scale) / 2.0));
+                snapshot.scale(scale, scale);
+                snapshot.append_layout(&layout, &render::rgba(colors.text, 1.0));
+                snapshot.restore();
             }
             Mark::Title(title, kind) => {
                 let layout = view.create_pango_layout(None);

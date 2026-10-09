@@ -52,7 +52,8 @@ title in its colour; quotes get a bar beside them and callouts a box behind them
 tasks are struck through. Tables, pictures, formulas (`$$…$$`), Mermaid diagrams and
 embedded notes (`![[Note]]`) on lines of their own are drawn as in the rendered view, over
 their lines, until the cursor goes into them; a picture in a sentence or a list item is drawn
-under its line. Inline math, HTML and front matter stay as written. Settings → Edit Markdown
+under its line, and a formula (`$…$`) in a line is drawn in it, the line closing up round it.
+HTML and front matter stay as written. Settings → Edit Markdown
 as → Source shows all of it, styled.
 
 **Links, as in Obsidian.** A `[[link]]` or a relative link opens the note beside this one if
@@ -243,4 +244,4 @@ Dev hooks (environment variables, no effect otherwise; `nevis` passes them to `n
 
 ## Next
 
-- Other Mermaid diagrams (state, class, Gantt); inline formulas drawn in Live Preview.
+- Other Mermaid diagrams (state, class, Gantt).
