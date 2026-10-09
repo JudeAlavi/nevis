@@ -11,6 +11,7 @@ mod devhooks;
 mod editor;
 mod find;
 mod flowchart;
+mod gantt;
 mod gtkcolors;
 mod help;
 mod links;

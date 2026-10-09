@@ -18,7 +18,7 @@ use sourceview::subclass::prelude::*;
 use crate::render::{self, Look, Panel};
 use crate::style::{Block, Mark};
 use crate::theme::{self, fonts};
-use crate::{classes, devhooks, flowchart, sequence, state};
+use crate::{classes, devhooks, flowchart, gantt, sequence, state};
 
 /// Finds a file a link names (as the rendered view does).
 type Finder = Box<dyn Fn(&str) -> Option<gio::File>>;
@@ -351,9 +351,10 @@ impl Paper {
                 let code = code.join("\n");
                 let picture = match flowchart::parse(&code).or_else(|| state::parse(&code)) {
                     Some(chart) => flowchart::picture(&chart, &text),
-                    None => match classes::parse(&code) {
-                        Some(diagram) => classes::picture(&diagram, &text),
-                        None => sequence::picture(&sequence::parse(&code)?, &text),
+                    None => match (classes::parse(&code), gantt::parse(&code)) {
+                        (Some(diagram), _) => classes::picture(&diagram, &text),
+                        (_, Some(chart)) => gantt::picture(&chart, &text),
+                        _ => sequence::picture(&sequence::parse(&code)?, &text),
                     },
                 };
                 let paintable = picture.paintable()?;

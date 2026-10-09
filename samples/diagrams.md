@@ -99,6 +99,24 @@ classDiagram
     }
 ```
 
+A Gantt chart: sections, kinds, a milestone, tasks after others, weekends left out:
+
+```mermaid
+gantt
+    title Release plan
+    dateFormat YYYY-MM-DD
+    axisFormat %b %e
+    excludes weekends
+    section Design
+    Research          :done, r1, 2024-01-01, 4d
+    Mockups           :active, m1, after r1, 5d
+    section Build
+    Backend           :crit, b1, after m1, 8d
+    Frontend          :f1, after m1, 6d
+    section Ship
+    Release           :milestone, after b1, 0d
+```
+
 None of those, so it stays code:
 
 ```mermaid
