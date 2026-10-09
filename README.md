@@ -47,7 +47,7 @@ on the lines with the cursor or the selection, as in Obsidian: headings without 
 **bold** without its `**`, ==highlights== without their `==`, links as their words, quotes
 without `>`, block ids (`^id`) gone, code blocks without their fences while the cursor is
 outside them. In place of their markup it draws a dot for each `-`, a checkbox for each
-`[ ]` (click it to tick it; the cursor stays where it is), a line for a rule and a callout's
+`[ ]` (click it to tick it; the cursor stays where it is; a click on a link opens it, Ctrl+click in a new tab, and on a `#tag` searches), a line for a rule and a callout's
 title in its colour; quotes get a bar beside them and callouts a box behind them. Ticked
 tasks are struck through. Tables, pictures, formulas (`$$…$$`), Mermaid diagrams and
 embedded notes (`![[Note]]`) on lines of their own are drawn as in the rendered view, over

@@ -152,6 +152,27 @@ impl Styler {
         self.enabled.get()
     }
 
+    /// Whether Live Preview is on for this text (Markdown, styled).
+    pub fn is_live(&self) -> bool {
+        self.live.get() && self.enabled.get()
+    }
+
+    /// Whether `line` is being edited: the cursor's, or one the selection touches.
+    pub fn is_editing(&self, line: usize) -> bool {
+        self.editing_lines().is_some_and(|(first, last)| (first..=last).contains(&line))
+    }
+
+    /// The span of one of `kinds` at character `offset`, as styled last.
+    pub fn span_at(&self, kinds: &[Kind], offset: usize) -> Option<Range<usize>> {
+        let styled = self.styled.borrow();
+        let (_, spans) = styled.as_ref()?;
+        kinds.iter().find_map(|&kind| {
+            let ranges = spans.of(kind);
+            let after = ranges.partition_point(|range| range.end <= offset);
+            ranges.get(after).filter(|range| range.start <= offset).cloned()
+        })
+    }
+
     /// Live Preview on or off: markup hidden except where the cursor is.
     pub fn set_live(&self, on: bool) {
         self.live.set(on);

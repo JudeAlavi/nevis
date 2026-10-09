@@ -1,5 +1,7 @@
 //! Where a link inside a note points: the file to open and the heading to scroll to.
 
+use pulldown_cmark::{Event, LinkType, Tag};
+
 /// A link's file part (relative to the note; empty means the note itself) and heading.
 #[derive(Debug, PartialEq)]
 pub struct Target {
@@ -56,9 +58,41 @@ pub fn decode(text: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
 }
 
+/// The link at byte `at` in Markdown `source` (on its words, its address or its brackets),
+/// as it would be followed: what a click there opens. Pictures and embedded notes aren't
+/// followed.
+pub fn at(source: &str, at: usize) -> Option<String> {
+    for (event, range) in crate::render::events(source) {
+        match event {
+            Event::Start(Tag::Link { link_type, dest_url, .. }) if range.contains(&at) => {
+                return Some(match link_type {
+                    LinkType::Email => format!("mailto:{dest_url}"),
+                    _ => dest_url.to_string(),
+                });
+            }
+            Event::Start(Tag::Image { .. }) if range.contains(&at) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_link_under_a_click_is_what_it_opens() {
+        let text = "See [the plan](Plans.md#Budget) and [[Notes/Trip|trip]] or <https://x.org>.\n![[pic.png]] [[Other]]";
+        let under = |words: &str| at(text, text.find(words).unwrap());
+        assert_eq!(under("plan"), Some("Plans.md#Budget".to_owned()));
+        assert_eq!(under("(Plans"), Some("Plans.md#Budget".to_owned()));
+        assert_eq!(under("trip]]"), Some("Notes/Trip".to_owned()));
+        assert_eq!(under("x.org"), Some("https://x.org".to_owned()));
+        assert_eq!(under("Other"), Some("Other".to_owned()));
+        assert_eq!(under("See"), None);
+        assert_eq!(under("pic.png"), None);
+    }
 
     fn target(path: &str, heading: Option<&str>) -> Target {
         Target { path: path.to_owned(), heading: heading.map(str::to_owned) }

@@ -115,6 +115,12 @@ pub enum OnLoad {
     Restore { text: Option<String>, line: u32, column: u32, reading: bool },
 }
 
+/// What a click in the source view follows.
+enum Clicked {
+    Link(String),
+    Tag(String),
+}
+
 impl Editor {
     pub fn new(host: &Rc<Window>) -> Rc<Self> {
         let buffer = sourceview::Buffer::new(None);
@@ -507,11 +513,37 @@ impl Editor {
             }
         });
         self.view.add_controller(tick);
+        // A link opens on a click, as in Obsidian: in Live Preview on a line not being edited,
+        // anywhere with Ctrl (in a new tab, as in the rendered view). A #tag searches.
+        let follow = gtk::GestureClick::builder().button(gdk::BUTTON_PRIMARY).propagation_phase(gtk::PropagationPhase::Capture).build();
+        let weak = Rc::downgrade(self);
+        follow.connect_pressed(move |gesture, presses, x, y| {
+            let Some(editor) = weak.upgrade() else { return };
+            let state = gesture.current_event_state();
+            if presses != 1 || state.intersects(gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::ALT_MASK) {
+                return;
+            }
+            let new_tab = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let Some(clicked) = editor.clicked_at(x, y, new_tab) else { return };
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            editor.styler.set_dragging(false);
+            match clicked {
+                Clicked::Link(url) => editor.open_link(&url, new_tab),
+                Clicked::Tag(tag) => {
+                    if let Some(host) = editor.host.upgrade() {
+                        host.search_for(&tag);
+                    }
+                }
+            }
+        });
+        self.view.add_controller(follow);
         let pointer = gtk::EventControllerMotion::new();
         let weak = Rc::downgrade(self);
-        pointer.connect_motion(move |_, x, y| {
+        pointer.connect_motion(move |controller, x, y| {
             if let Some(editor) = weak.upgrade() {
-                editor.view.set_cursor_from_name(Some(if editor.view.task_at(x, y).is_some() { "pointer" } else { "text" }));
+                let ctrl = controller.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
+                let hand = editor.view.task_at(x, y).is_some() || editor.followable_at(x, y, ctrl).is_some();
+                editor.view.set_cursor_from_name(Some(if hand { "pointer" } else { "text" }));
             }
         });
         self.view.add_controller(pointer);
@@ -1082,10 +1114,11 @@ impl Editor {
     }
 
     /// Scrolls the rendered view to the heading a `#…` link names.
+    /// Goes to the heading `target` names: in either view.
     fn jump_to_heading(&self, target: &str) {
-        let headings = self.headings.borrow();
-        if let Some((_, mark)) = headings.iter().find(|(text, _)| anchors::points_at(target, text)) {
-            self.reader.scroll_to_mark(mark, 0.0, true, 0.0, 0.0);
+        let headings = outline::headings(&self.text());
+        if let Some(index) = headings.iter().position(|heading| anchors::points_at(target, &heading.text)) {
+            self.go_to_heading(index, &headings);
         }
     }
 
@@ -1127,6 +1160,35 @@ impl Editor {
                 }
             }
         }
+    }
+
+    /// The link or tag at `x`, `y` in the source view a click follows (see `followable_at`): the
+    /// link's address, read from the text, or the tag.
+    fn clicked_at(&self, x: f64, y: f64, ctrl: bool) -> Option<Clicked> {
+        let (offset, tag) = self.followable_at(x, y, ctrl)?;
+        let text = self.text();
+        if tag {
+            let span = self.styler.span_at(&[style::Kind::Tag], offset)?;
+            return Some(Clicked::Tag(text.chars().skip(span.start).take(span.len()).collect()));
+        }
+        let byte = text.char_indices().nth(offset)?.0;
+        links::at(&text, byte).map(Clicked::Link)
+    }
+
+    /// The character at `x`, `y` in the source view if a click there follows a link (or searches
+    /// a tag: then true): in Live Preview on a line not being edited, or with `ctrl`.
+    fn followable_at(&self, x: f64, y: f64, ctrl: bool) -> Option<(usize, bool)> {
+        let (bx, by) = self.view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        let iter = self.view.iter_at_location(bx, by)?;
+        // Past a line's end isn't on it.
+        if iter.ends_line() || !(ctrl || (self.styler.is_live() && !self.styler.is_editing(iter.line() as usize))) {
+            return None;
+        }
+        let offset = iter.offset() as usize;
+        if self.styler.span_at(&[style::Kind::LinkText, style::Kind::Url], offset).is_some() {
+            return Some((offset, false));
+        }
+        self.styler.span_at(&[style::Kind::Tag], offset).map(|_| (offset, true))
     }
 
     /// Ticks the task whose "[ ]" is at `task` (characters), or unticks it, as one undo step.
