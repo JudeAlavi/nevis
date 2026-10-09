@@ -204,6 +204,24 @@ pub fn properties(yaml: &str) -> Vec<(String, Vec<String>)> {
     found
 }
 
+/// A note's aliases (`aliases:`, or `alias:`, in its front matter): other names links may
+/// call it by.
+pub fn aliases(text: &str) -> Vec<String> {
+    let end = render::front_matter(text);
+    if end == 0 {
+        return Vec::new();
+    }
+    // Between its first line and its last (the `---`s).
+    let mut lines: Vec<&str> = text[..end].split_inclusive('\n').collect();
+    lines.pop();
+    let yaml: String = lines.into_iter().skip(1).collect();
+    properties(&yaml)
+        .into_iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("aliases") || name.eq_ignore_ascii_case("alias"))
+        .flat_map(|(_, values)| values)
+        .collect()
+}
+
 /// Obsidian's additions in a note, read with its code found once.
 pub struct Additions {
     pub highlights: Vec<Range<usize>>,
@@ -317,6 +335,14 @@ mod tests {
                 ("empty".to_owned(), owned(&[])),
             ]
         );
+    }
+
+    #[test]
+    fn a_notes_aliases_come_from_its_front_matter() {
+        assert_eq!(aliases("---\ntitle: x\naliases: [Sicily trip, \"Trip 2026\"]\n---\n# Plan\n"), vec!["Sicily trip", "Trip 2026"]);
+        assert_eq!(aliases("---\nalias: Only one\n---\n"), vec!["Only one"]);
+        assert_eq!(aliases("---\naliases:\n  - First\n  - Second\n---\n"), vec!["First", "Second"]);
+        assert_eq!(aliases("# Not front matter\naliases: [Nope]\n"), Vec::<String>::new());
     }
 
     #[test]

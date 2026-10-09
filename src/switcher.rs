@@ -37,6 +37,8 @@ enum Found {
     File(usize),
     Heading(String, String),
     Tag(String),
+    /// A note (its path) by one of its aliases.
+    Alias(String, String),
 }
 
 impl Switcher {
@@ -159,6 +161,13 @@ impl Switcher {
                 .collect();
             let texts: Vec<String> = headings.iter().map(|(_, heading)| heading.to_string()).collect();
             shown.extend(rank(&query, &texts).into_iter().take(15).map(|i| Found::Heading(headings[i].0.to_owned(), headings[i].1.to_owned())));
+            let aliases: Vec<(&str, &str)> = index
+                .iter()
+                .flat_map(|notes| notes.iter())
+                .flat_map(|note| note.aliases.iter().map(|alias| (note.path.as_str(), alias.as_str())))
+                .collect();
+            let words: Vec<String> = aliases.iter().map(|(_, alias)| alias.to_string()).collect();
+            shown.extend(rank(&query, &words).into_iter().take(10).map(|i| Found::Alias(aliases[i].0.to_owned(), aliases[i].1.to_owned())));
             let tags = tags();
             shown.extend(rank(&query, &tags).into_iter().take(5).map(|i| Found::Tag(format!("#{}", tags[i]))));
         }
@@ -177,6 +186,10 @@ impl Switcher {
                     )
                 }
                 Found::Tag(tag) => glib::markup_escape_text(tag).to_string(),
+                Found::Alias(path, alias) => {
+                    let note = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".md");
+                    format!("{}  <span alpha=\"55%\">\u{2192} {}</span>", glib::markup_escape_text(alias), glib::markup_escape_text(note))
+                }
             };
             let label = gtk::Label::builder()
                 .use_markup(true)
@@ -202,6 +215,7 @@ impl Switcher {
             Some(Found::Heading(path, heading)) => {
                 self.vault.borrow().as_ref().map(|vault| (gio::File::for_path(vault.join(path)), Some(heading.clone())))
             }
+            Some(Found::Alias(path, _)) => self.vault.borrow().as_ref().map(|vault| (gio::File::for_path(vault.join(path)), None)),
             Some(Found::Tag(tag)) => {
                 let tag = tag.clone();
                 self.hide();

@@ -50,7 +50,7 @@ pub fn events(source: &str) -> impl Iterator<Item = (Event<'_>, Range<usize>)> {
 
 /// How long the note's front matter is, in bytes: from a first line of `---` through the `---`
 /// or `...` line that closes it; 0 when the note has none.
-fn front_matter(source: &str) -> usize {
+pub fn front_matter(source: &str) -> usize {
     let mut lines = source.split_inclusive('\n');
     let Some(first) = lines.next().filter(|line| line.trim_end() == "---") else { return 0 };
     let mut length = first.len();

@@ -1049,7 +1049,8 @@ impl Window {
     /// with unsaved changes gets the change in its tab; the others are rewritten on disk.
     async fn update_links(self: Rc<Self>, root: PathBuf, old: String, new: String, files: Vec<String>) {
         let (searched, wanted, listed) = (root.clone(), old.clone(), files.clone());
-        let Ok(found) = gio::spawn_blocking(move || backlinks::find(&searched, &wanted, &listed)).await else { return };
+        // Links by an alias still lead to the note under its new name: those stay as they are.
+        let Ok(found) = gio::spawn_blocking(move || backlinks::find(&searched, &wanted, &listed, &[])).await else { return };
         if found.is_empty() {
             return;
         }

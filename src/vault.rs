@@ -21,6 +21,8 @@ pub struct Note {
     pub path: String,
     pub headings: Vec<String>,
     pub tags: Vec<String>,
+    /// Other names links may call it by (its front matter's `aliases`).
+    pub aliases: Vec<String>,
 }
 
 /// More files than this aren't listed (a vault that big is someone's home folder).
@@ -110,7 +112,8 @@ fn read_notes(root: &Path, notes: &[String]) -> Vec<Note> {
                             let mut tags: Vec<String> = obsidian::tags(&text).into_iter().map(|range| text[range].to_owned()).collect();
                             tags.sort();
                             tags.dedup();
-                            Some(Note { path: path.clone(), headings, tags })
+                            let aliases = obsidian::aliases(&text);
+                            Some(Note { path: path.clone(), headings, tags, aliases })
                         })
                         .collect::<Vec<_>>()
                 })
@@ -268,9 +271,34 @@ fn renamed_in(source: &str, name: &str) -> Option<String> {
     Some(format!("{}{written}{after})", &source[..open]))
 }
 
+/// The note `target` (a link's path, its `.md` aside) is another name of, by `notes`' aliases,
+/// case aside: for a link no file's name matches, as Obsidian falls back to aliases.
+pub fn by_alias(target: &str, notes: &[Note]) -> Option<String> {
+    let name = target.strip_suffix(".md").unwrap_or(target).to_lowercase();
+    notes.iter().find(|note| note.aliases.iter().any(|alias| alias.to_lowercase() == name)).map(|note| note.path.clone())
+}
+
+/// The aliases of the note at `path` under `root`, as the vault's index has them (none before
+/// it is first read).
+pub fn aliases_of(root: &Path, path: &str) -> Vec<String> {
+    index(root, |_| {}).and_then(|notes| notes.iter().find(|note| note.path == path).map(|note| note.aliases.clone())).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn note(path: &str, aliases: &[&str]) -> Note {
+        Note { path: path.to_owned(), headings: Vec::new(), tags: Vec::new(), aliases: aliases.iter().map(|alias| alias.to_string()).collect() }
+    }
+
+    #[test]
+    fn a_name_no_file_has_is_looked_for_among_aliases() {
+        let notes = vec![note("Other.md", &[]), note("Trips/Plan.md", &["Sicily trip", "Trip 2026"])];
+        assert_eq!(by_alias("sicily TRIP", &notes).as_deref(), Some("Trips/Plan.md"));
+        assert_eq!(by_alias("Trip 2026.md", &notes).as_deref(), Some("Trips/Plan.md"));
+        assert_eq!(by_alias("Nowhere", &notes), None);
+    }
 
     fn files(list: &[&str]) -> Vec<String> {
         list.iter().map(|path| path.to_string()).collect()

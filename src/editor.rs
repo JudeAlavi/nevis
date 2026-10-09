@@ -826,6 +826,19 @@ impl Editor {
             self.reader.set_right_margin(side);
         }
         let text = self.text();
+        // Links by an alias are found once the vault's notes are read (and notes linking here
+        // by one of its aliases): rendered and searched again then.
+        if let Some((root, _, _)) = self.vault() {
+            let me = self.me.clone();
+            let _ = vault::index(&root, move |_| {
+                if let Some(editor) = me.upgrade() {
+                    editor.refresh(false);
+                    if editor.is_reading() {
+                        editor.find_backlinks();
+                    }
+                }
+            });
+        }
         let folder = self.location().and_then(|l| l.parent());
         let reader = self.reader.clone();
         let layout = move |text: &str| reader.create_pango_layout(Some(text));
@@ -864,11 +877,12 @@ impl Editor {
         let to = to.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
         let root = gio::File::for_path(&on_disk);
         let files: Vec<String> = files.as_ref().clone();
+        let aliases = vault::aliases_of(&on_disk, &to);
         let search = self.backlink_searches.get() + 1;
         self.backlink_searches.set(search);
         let me = self.me.clone();
         glib::spawn_future_local(async move {
-            let Ok(found) = gio::spawn_blocking(move || backlinks::find(&on_disk, &to, &files)).await else { return };
+            let Ok(found) = gio::spawn_blocking(move || backlinks::find(&on_disk, &to, &files, &aliases)).await else { return };
             let Some(editor) = me.upgrade() else { return };
             if editor.backlink_searches.get() != search {
                 return;
@@ -1029,7 +1043,9 @@ impl Editor {
     /// The file a link in this note names (its path, decoded), the way Obsidian finds it.
     fn find(&self, path: &str) -> Option<gio::File> {
         let (root, files, from) = self.vault()?;
-        vault::resolve(path, &from, &files).map(|found| gio::File::for_path(root.join(found)))
+        // By a file's name, or else by a note's aliases.
+        let found = vault::resolve(path, &from, &files).or_else(|| vault::by_alias(path, &vault::index(&root, |_| {})?))?;
+        Some(gio::File::for_path(root.join(found)))
     }
 
     /// The pointer is on `target` (or nothing) in the rendered view, at `x`, `y`: resting on a
@@ -1856,6 +1872,17 @@ impl Editor {
             let (name, folder, path) = &entries[i];
             let text = if seen.get(&name.to_lowercase()).copied().unwrap_or(0) > 1 { path.trim_end_matches(".md").to_owned() } else { name.clone() };
             offers.push(Offer { markup: complete::markup(name, folder), text });
+        }
+        // Notes' aliases too: chosen, the link names the note and shows the alias.
+        if let Some(notes) = vault::index(&root, |_| {}) {
+            let aliases: Vec<(String, &str)> = notes.iter().flat_map(|note| note.aliases.iter().map(|alias| (alias.clone(), note.path.as_str()))).collect();
+            let words: Vec<String> = aliases.iter().map(|(alias, _)| alias.clone()).collect();
+            for i in switcher::rank(query, &words).into_iter().take(complete::ROWS) {
+                let (alias, path) = &aliases[i];
+                let name = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".md");
+                let note = if seen.get(&name.to_lowercase()).copied().unwrap_or(0) > 1 { path.trim_end_matches(".md") } else { name };
+                offers.push(Offer { markup: complete::markup(alias, &format!("\u{2192} {name}")), text: format!("{note}|{alias}") });
+            }
         }
         offers.truncate(complete::ROWS);
         offers

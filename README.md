@@ -58,7 +58,9 @@ as → Source shows all of it, styled.
 **Links, as in Obsidian.** A `[[link]]` or a relative link opens the note beside this one if
 there is one, and otherwise the note of that name anywhere in the vault (the folder holding
 `.obsidian`, or the folder the window shows), case aside; a path (`[[Projects/Plans]]`) has to
-match whole folder names, and the shortest path wins a tie. Links to notes that don't exist
+match whole folder names, and the shortest path wins a tie. A name no file has is looked for
+among notes' `aliases:` (front matter): `[[Sicily trip]]` opens the note that lists it, counts
+in its *Linked from*, and is offered by `[[` and Ctrl+P. Links to notes that don't exist
 yet are fainter; following one starts the note. Resting the pointer on a link in the
 rendered view shows the start of its note. Typing `[[` offers the vault's notes (and today's,
 tomorrow's and yesterday's daily notes), `[[Note#` its headings, `#` the vault's tags and
