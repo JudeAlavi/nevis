@@ -187,10 +187,11 @@ impl Styles {
             emphasis: add(gtk::TextTag::builder().style(pango::Style::Italic).build()),
             strike: add(gtk::TextTag::builder().strikethrough(true).build()),
             code: add(gtk::TextTag::builder().family(fonts::MONO).foreground(theme::colors().code.to_hex()).background(theme::colors().code_background.to_hex()).build()),
+            // Its background is a panel (see `Panel`): a paragraph background leaves out blank
+            // lines, splitting a block in two.
             code_block: add(gtk::TextTag::builder()
                 .family(fonts::MONO)
                 .foreground(theme::colors().code.to_hex())
-                .paragraph_background(theme::colors().code_background.to_hex())
                 .direction(gtk::TextDirection::Ltr)
                 .left_margin(margin + 12)
                 .right_margin(margin + 12)
@@ -613,6 +614,11 @@ impl<'m> Renderer<'m> {
                 self.end_line();
                 self.block.pop();
                 if let Some(start) = self.code_start.take() {
+                    let first = self.buffer.create_mark(None, &self.buffer.iter_at_offset(start), true);
+                    let last = self.buffer.create_mark(None, &self.buffer.end_iter(), true);
+                    let look = Look::Box(rgba(theme::colors().code_background, 1.0));
+                    // Its text is 12 px in from the margin; its box, 4.
+                    self.panels.push(Panel { start: first, end: last, inset: self.margin + 4 - self.origin, look, rtl: false, fold: None });
                     if let Some(language) = self.code_language.take() {
                         let start = self.buffer.create_mark(None, &self.buffer.iter_at_offset(start), true);
                         let end = self.buffer.create_mark(None, &self.buffer.end_iter(), true);

@@ -248,15 +248,28 @@ impl Styler {
         }
     }
 
-    /// Live Preview's panels for the quotes and callouts styled last: a bar or a box out in
-    /// the margins, the text staying where it is. None when it's off.
+    /// The panels for what was styled last: a box behind each code block, and in Live Preview,
+    /// a bar beside each quote and a box behind each callout. Out in the margins, the text
+    /// staying where it is.
     fn update_panels(&self) {
         let Some(paper) = self.paper.borrow().clone() else { return };
-        let panels = match &*self.styled.borrow() {
-            Some((text, spans)) if self.live.get() && self.enabled.get() => panels(text, spans),
-            _ => Vec::new(),
+        let (panels, code) = match &*self.styled.borrow() {
+            Some((text, spans)) if self.enabled.get() => {
+                let quotes = if self.live.get() { panels(text, spans) } else { Vec::new() };
+                (quotes, spans.of(Kind::CodeBlock).to_vec())
+            }
+            _ => (Vec::new(), Vec::new()),
         };
-        let accent = theme::colors().accent;
+        let colors = theme::colors();
+        let code = code.into_iter().map(|range| render::Panel {
+            start: self.buffer.create_mark(None, &self.iter_at(range.start), true),
+            end: self.buffer.create_mark(None, &self.iter_at(range.end), false),
+            inset: -12,
+            look: render::Look::Box(render::rgba(colors.code_background, 1.0)),
+            rtl: false,
+            fold: None,
+        });
+        let accent = colors.accent;
         let panels = panels
             .into_iter()
             .map(|(range, kind)| {
@@ -274,6 +287,7 @@ impl Styler {
                     fold: None,
                 }
             })
+            .chain(code)
             .collect();
         paper.set_panels(panels);
     }
@@ -467,9 +481,10 @@ fn tag_for(kind: Kind) -> gtk::TextTag {
             .build(),
         Kind::Comment => gtk::TextTag::builder().foreground(theme::colors().dim.to_hex()).style(pango::Style::Italic).build(),
         Kind::Quote => gtk::TextTag::builder().foreground(theme::colors().quote.to_hex()).style(pango::Style::Italic).build(),
+        // Its background is a panel the view draws (see `update_panels`): a paragraph background
+        // leaves out blank lines, splitting a block in two.
         Kind::CodeBlock => gtk::TextTag::builder()
             .foreground(theme::colors().code.to_hex())
-            .paragraph_background(theme::colors().code_background.to_hex())
             .direction(gtk::TextDirection::Ltr)
             .build(),
         Kind::Frontmatter | Kind::Html | Kind::Url => gtk::TextTag::builder().foreground(theme::colors().dim.to_hex()).build(),
