@@ -11,6 +11,11 @@
 //!   clipboard holds, which test runs share with the desktop).
 //! - `NEVIS_WAIT=ms`: how long to wait before typing and the picture (default 500).
 //! - `NEVIS_SETTLE=ms`: how long to wait after typing, before the picture (default 300).
+//! - `NEVIS_SESSION=1`: keep and restore the session, which these runs otherwise leave alone
+//!   (with `XDG_STATE_HOME=/tmp/x`, away from the real one).
+//! - `NEVIS_APP_ID=dev.shirvani.NevisTest`: a separate instance, leaving the real service alone.
+//! - `NEVIS_TRACE=1 nevis-app --gapplication-service`: print checkpoints, and when each window's
+//!   text is on screen.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

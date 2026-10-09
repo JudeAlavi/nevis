@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build nevis and install it for the current user:
+# Install nevis for the current user (building it first, in a checkout; a release comes built):
 #   ~/.local/bin/nevis (launcher) and nevis-app, the desktop entry, and a systemd user
 #   service that keeps nevis-app running.
 # Set NEVIS_DEFAULT=0 to skip making it the default app for .txt and .md files.
@@ -10,11 +10,16 @@ bindir="$HOME/.local/bin"
 apps="$HOME/.local/share/applications"
 units="$HOME/.config/systemd/user"
 
-# Capped parallelism: an all-core build overheats this laptop.
-cargo build --release -j "${JOBS:-6}"
+if [[ -x bin/nevis-app ]]; then
+    built=bin
+else
+    # Capped parallelism: an all-core build overheats this laptop.
+    cargo build --release -j "${JOBS:-6}"
+    built=target/release
+fi
 
-install -Dm755 target/release/nevis "$bindir/nevis"
-install -Dm755 target/release/nevis-app "$bindir/nevis-app"
+install -Dm755 "$built/nevis" "$bindir/nevis"
+install -Dm755 "$built/nevis-app" "$bindir/nevis-app"
 mkdir -p "$apps" "$units"
 first_install=true
 [[ -e "$units/nevis.service" ]] && first_install=false

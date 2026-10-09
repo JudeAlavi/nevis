@@ -1,0 +1,54 @@
+# A GitHub release for each version tag. To make one:
+#   ./release.sh 0.2.0                # sets the version, commits it and tags v0.2.0
+#   git push origin main v0.2.0       # then this builds the release and publishes it
+# The release gets nevis-<version>-x86_64-linux.tar.gz (both programs, built on Ubuntu 24.04
+# so they run there and on newer systems, with install.sh) and its SHA-256 sum.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the tag is Cargo.toml's version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::$GITHUB_REF_NAME is not Cargo.toml's version ($version): tag with ./release.sh"
+            exit 1
+          fi
+
+      - name: Install GTK 4 and GtkSourceView 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libgtksourceview-5-dev
+
+      - name: Test and build
+        run: |
+          rustup update stable --no-self-update
+          cargo test --release --locked --bin nevis-app
+          cargo build --release --locked
+
+      - name: Package
+        run: |
+          name="nevis-${GITHUB_REF_NAME#v}-x86_64-linux"
+          mkdir -p "$name/bin" "$name/data"
+          cp target/release/nevis target/release/nevis-app "$name/bin/"
+          cp data/*.in "$name/data/"
+          cp install.sh README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" nevis-*-x86_64-linux.tar.gz* --title "nevis ${GITHUB_REF_NAME#v}" --generate-notes
