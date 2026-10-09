@@ -4,7 +4,7 @@ use std::path::Path;
 
 use pulldown_cmark::{Event, Tag};
 
-use crate::{links, listing, render, switcher};
+use crate::{links, listing, render, vault};
 
 /// Notes bigger than this aren't read (nobody writes a 4 MB note by hand).
 const BIGGEST: u64 = 4 << 20;
@@ -16,10 +16,10 @@ pub struct Mention {
     pub text: String,
 }
 
-/// The lines of `text`, the note at `from`, with links that lead to the note at `to`: the
-/// way nevis follows them, `[[Name]]` and relative links resolved from `from`'s folder.
-/// Both paths are relative to the same folder, with "/" between their parts.
-pub fn mentions(text: &str, from: &str, to: &str) -> Vec<Mention> {
+/// The lines of `text`, the note at `from`, with links that lead to the note at `to`, followed
+/// the way a click follows them (`vault::resolve`) among the vault's `files`. Paths are
+/// relative to the vault, with "/" between their parts.
+pub fn mentions(text: &str, from: &str, to: &str, files: &[String]) -> Vec<Mention> {
     let folder = from.rsplit_once('/').map_or("", |(folder, _)| folder);
     let mut lines: Vec<usize> = Vec::new();
     for (event, range) in render::events(text) {
@@ -28,7 +28,7 @@ pub fn mentions(text: &str, from: &str, to: &str) -> Vec<Mention> {
             continue;
         }
         let target = links::split(&dest_url);
-        if target.path.is_empty() || resolve(folder, &target.path).as_deref() != Some(to) {
+        if target.path.is_empty() || vault::resolve(&target.path, folder, files).as_deref() != Some(to) {
             continue;
         }
         let line = text[..range.start].matches('\n').count();
@@ -40,24 +40,24 @@ pub fn mentions(text: &str, from: &str, to: &str) -> Vec<Mention> {
     lines.into_iter().map(|line| Mention { line, text: all.get(line).unwrap_or(&"").trim().to_owned() }).collect()
 }
 
-/// The notes under `root` that link to `to` (relative to `root`), with the lines that do, in
-/// the order the folder lists them. Reads the notes on a few threads; call it off the main one.
-pub fn find(root: &Path, to: &str) -> Vec<(String, Vec<Mention>)> {
-    let files = switcher::files_under(root);
+/// The notes among the vault's `files` (at `root`) that link to `to`, with the lines that do,
+/// in the order listed. Reads the notes on a few threads; call it off the main one.
+pub fn find(root: &Path, to: &str, files: &[String]) -> Vec<(String, Vec<Mention>)> {
+    let notes: Vec<&String> = files.iter().filter(|path| listing::is_note(path)).collect();
     // Only notes with the linked note's name in them, written either way, are read closely.
     let name = to.rsplit('/').next().unwrap_or(to);
     let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
     let encoded = percent(stem);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
-    let share = files.len().div_ceil(threads).max(1);
+    let share = notes.len().div_ceil(threads).max(1);
     let (stem, encoded) = (stem, encoded.as_str());
     std::thread::scope(|scope| {
-        let running: Vec<_> = files
+        let running: Vec<_> = notes
             .chunks(share)
             .map(|part| {
                 scope.spawn(move || {
                     let mut found = Vec::new();
-                    for path in part.iter().filter(|path| path.as_str() != to && listing::is_note(path)) {
+                    for &path in part.iter().filter(|path| path.as_str() != to) {
                         let on_disk = root.join(path);
                         if std::fs::metadata(&on_disk).is_ok_and(|m| m.len() > BIGGEST) {
                             continue;
@@ -66,7 +66,7 @@ pub fn find(root: &Path, to: &str) -> Vec<(String, Vec<Mention>)> {
                         if !text.contains(stem) && !text.contains(encoded) {
                             continue;
                         }
-                        let lines = mentions(&text, path, to);
+                        let lines = mentions(&text, path, to, files);
                         if !lines.is_empty() {
                             found.push((path.clone(), lines));
                         }
@@ -86,25 +86,6 @@ fn percent(text: &str) -> String {
         .collect()
 }
 
-/// `path` followed from `folder`, `.` and `..` worked out; `None` when it is absolute or
-/// climbs above the top.
-fn resolve(folder: &str, path: &str) -> Option<String> {
-    if path.starts_with('/') {
-        return None;
-    }
-    let mut parts: Vec<&str> = folder.split('/').filter(|part| !part.is_empty()).collect();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            part => parts.push(part),
-        }
-    }
-    Some(parts.join("/"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,11 +94,16 @@ mod tests {
         Mention { line, text: text.to_owned() }
     }
 
+    fn vault(list: &[&str]) -> Vec<String> {
+        list.iter().map(|path| path.to_string()).collect()
+    }
+
     #[test]
     fn wiki_names_headings_and_relative_links_all_count() {
+        let files = vault(&["Daily.md", "Plans.md", "Other.md"]);
         let text = "See [[Plans]].\nAlso [[Plans#Budget|the budget]]\n[the plan](Plans.md) and [web](https://x.org)\n[[Other]]\n";
         assert_eq!(
-            mentions(text, "Daily.md", "Plans.md"),
+            mentions(text, "Daily.md", "Plans.md", &files),
             vec![
                 mention(0, "See [[Plans]]."),
                 mention(1, "Also [[Plans#Budget|the budget]]"),
@@ -127,17 +113,29 @@ mod tests {
     }
 
     #[test]
-    fn links_lead_from_the_linking_notes_folder() {
+    fn links_lead_from_the_linking_notes_folder_first() {
+        let files = vault(&["Plans.md", "Daily/Plans.md", "Daily/Trips/Sicily.md", "Daily/2026-10-08.md"]);
         let text = "[up](../Plans.md)\n[[Plans]]\n[down](./Trips/Sicily.md)\n";
-        assert_eq!(mentions(text, "Daily/2026-10-08.md", "Plans.md"), vec![mention(0, "[up](../Plans.md)")]);
-        assert_eq!(mentions(text, "Daily/2026-10-08.md", "Daily/Plans.md"), vec![mention(1, "[[Plans]]")]);
-        assert_eq!(mentions(text, "Daily/2026-10-08.md", "Daily/Trips/Sicily.md"), vec![mention(2, "[down](./Trips/Sicily.md)")]);
+        assert_eq!(mentions(text, "Daily/2026-10-08.md", "Plans.md", &files), vec![mention(0, "[up](../Plans.md)")]);
+        assert_eq!(mentions(text, "Daily/2026-10-08.md", "Daily/Plans.md", &files), vec![mention(1, "[[Plans]]")]);
+        assert_eq!(mentions(text, "Daily/2026-10-08.md", "Daily/Trips/Sicily.md", &files), vec![mention(2, "[down](./Trips/Sicily.md)")]);
+    }
+
+    #[test]
+    fn a_name_finds_its_note_anywhere_in_the_vault_as_a_click_would() {
+        let files = vault(&["1 - Rough Notes/Progress.md", "3 - Tags/algorithm.md"]);
+        let text = "tags: [[algorithm]] [[Algorithm|algo]]\n";
+        assert_eq!(
+            mentions(text, "1 - Rough Notes/Progress.md", "3 - Tags/algorithm.md", &files),
+            vec![mention(0, "tags: [[algorithm]] [[Algorithm|algo]]")]
+        );
     }
 
     #[test]
     fn code_does_not_count_and_names_match_however_they_are_written() {
+        let files = vault(&["a.md", "My Plans.md", "برنامه\u{200c}ها.md"]);
         let text = "`[[My Plans]]`\n```\n[[My Plans]]\n```\n[x](My%20Plans.md) and [[My Plans]]\n[[برنامه\u{200c}ها]]\n";
-        assert_eq!(mentions(text, "a.md", "My Plans.md"), vec![mention(4, "[x](My%20Plans.md) and [[My Plans]]")]);
-        assert_eq!(mentions(text, "a.md", "برنامه\u{200c}ها.md"), vec![mention(5, "[[برنامه\u{200c}ها]]")]);
+        assert_eq!(mentions(text, "a.md", "My Plans.md", &files), vec![mention(4, "[x](My%20Plans.md) and [[My Plans]]")]);
+        assert_eq!(mentions(text, "a.md", "برنامه\u{200c}ها.md", &files), vec![mention(5, "[[برنامه\u{200c}ها]]")]);
     }
 }

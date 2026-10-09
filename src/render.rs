@@ -81,12 +81,14 @@ pub struct CodeBlock {
     pub language: String,
 }
 
-/// Renders `source` into a new buffer. `folder` resolves relative image paths; `text` lays a
+/// Renders `source` into a new buffer. `folder` resolves relative image paths; `find` finds the
+/// file a link or embed names (in the vault, as Obsidian does), if there is one; `text` lays a
 /// text out in the view's font (list bullets hang by their width; diagrams use it too);
 /// `margin` is the view's side margin, which indented blocks add to.
 pub fn render(
     source: &str,
     folder: Option<&gio::File>,
+    find: &dyn Fn(&str) -> Option<gio::File>,
     scheme: Option<&sourceview::StyleScheme>,
     text: &dyn Fn(&str) -> pango::Layout,
     margin: i32,
@@ -94,7 +96,7 @@ pub fn render(
     let buffer = sourceview::Buffer::new(None);
     buffer.set_style_scheme(scheme);
     buffer.set_highlight_syntax(false);
-    let mut r = Renderer::new(folder, buffer, text, margin);
+    let mut r = Renderer::new(folder, find, buffer, text, margin);
     for (event, range) in events(source) {
         r.event(event, range);
     }
@@ -201,6 +203,8 @@ struct Cell {
 
 struct Renderer<'m> {
     folder: Option<gio::File>,
+    /// The file a link or embed names, if there is one.
+    find: &'m dyn Fn(&str) -> Option<gio::File>,
     text: &'m dyn Fn(&str) -> pango::Layout,
     /// The view's side margin, which indents add to.
     margin: i32,
@@ -237,10 +241,17 @@ struct Renderer<'m> {
 }
 
 impl<'m> Renderer<'m> {
-    fn new(folder: Option<&gio::File>, buffer: sourceview::Buffer, text: &'m dyn Fn(&str) -> pango::Layout, margin: i32) -> Self {
+    fn new(
+        folder: Option<&gio::File>,
+        find: &'m dyn Fn(&str) -> Option<gio::File>,
+        buffer: sourceview::Buffer,
+        text: &'m dyn Fn(&str) -> pango::Layout,
+        margin: i32,
+    ) -> Self {
         let styles = Styles::new(&buffer.tag_table(), margin);
         Self {
             folder: folder.cloned(),
+            find,
             text,
             margin,
             buffer,
@@ -385,8 +396,12 @@ impl<'m> Renderer<'m> {
                     LinkType::Email => format!("mailto:{dest_url}"),
                     _ => dest_url.to_string(),
                 };
+                // A link to a note that doesn't exist yet is fainter, as in Obsidian.
+                let path = links::split(&url).path;
+                let missing = !links::has_scheme(&url) && !path.is_empty() && (self.find)(&path).is_none();
+                let link = theme::colors().link;
                 let tag = gtk::TextTag::builder()
-                    .foreground(theme::colors().link.to_hex())
+                    .foreground_rgba(&gdk::RGBA::new(link.r as f32, link.g as f32, link.b as f32, if missing { 0.55 } else { 1.0 }))
                     .underline(pango::Underline::Single)
                     .build();
                 self.buffer.tag_table().add(&tag);
@@ -672,11 +687,24 @@ impl<'m> Renderer<'m> {
             return self.text(&format!("[image: {alt}]"));
         }
         let local = !url.contains("://");
-        // "Pasted%20image.png" is the file "Pasted image.png", as in links.
+        // "Pasted%20image.png" is the file "Pasted image.png", as in links; found beside the
+        // note, or anywhere in the vault by its name, as Obsidian finds embeds.
         let path = links::decode(url);
-        let texture = local
-            .then(|| self.folder.as_ref().map(|f| f.resolve_relative_path(&path)).unwrap_or_else(|| gio::File::for_path(&path)))
-            .and_then(|file| gdk::Texture::from_file(&file).ok());
+        let file = || {
+            (self.find)(&path)
+                .or_else(|| self.folder.as_ref().map(|f| f.resolve_relative_path(&path)))
+                .unwrap_or_else(|| gio::File::for_path(&path))
+        };
+        let texture = local.then(file).and_then(|file| gdk::Texture::from_file(&file).ok());
+        // Obsidian's sizes: ![[pic.png|300]] (the text after | comes as the alt) and
+        // ![caption|300x200](pic.png).
+        let (alt, size) = match alt.rsplit_once('|') {
+            Some((caption, size)) if picture_size(size).is_some() => (caption, picture_size(size)),
+            _ => match picture_size(alt) {
+                Some(size) => ("", Some(size)),
+                None => (alt, None),
+            },
+        };
         let Some(texture) = texture else {
             // Remote or unreadable: show the alt text as a link instead.
             let label = if alt.is_empty() { url } else { alt };
@@ -686,12 +714,17 @@ impl<'m> Renderer<'m> {
             self.styled(&format!("[image: {label}]"), tag, "", "");
             return;
         };
-        // Shown at most 720 px wide, keeping the aspect ratio.
+        // Shown at most 720 px wide unless a size is given, keeping the aspect ratio unless
+        // both sides are.
         let (w, h) = (texture.width().max(1), texture.height().max(1));
-        let width = w.min(720);
+        let (width, height) = match size {
+            Some((width, Some(height))) => (width, height),
+            Some((width, None)) => (width, h * width / w),
+            None => (w.min(720), h * w.min(720) / w),
+        };
         let picture = gtk::Picture::for_paintable(&texture);
         picture.set_can_shrink(true);
-        picture.set_size_request(width, h * width / w);
+        picture.set_size_request(width, height);
         if !alt.is_empty() {
             picture.set_alternative_text(Some(alt));
         }
@@ -881,6 +914,15 @@ fn language(manager: &sourceview::LanguageManager, name: &str) -> Option<sourcev
         other => other,
     };
     manager.language(id).or_else(|| manager.guess_language(Some(format!("file.{name}")), None))
+}
+
+/// An Obsidian picture size: "300" (the width) or "300x200".
+fn picture_size(text: &str) -> Option<(i32, Option<i32>)> {
+    let number = |text: &str| text.trim().parse::<i32>().ok().filter(|&n| n > 0 && n <= 4000);
+    match text.split_once('x') {
+        Some((width, height)) => Some((number(width)?, Some(number(height)?))),
+        None => Some((number(text)?, None)),
+    }
 }
 
 fn heading_index(level: HeadingLevel) -> usize {

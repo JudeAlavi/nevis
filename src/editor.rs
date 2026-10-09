@@ -16,8 +16,9 @@ use sourceview::prelude::*;
 use crate::render::{self, Target};
 use crate::session::{self, TabState};
 use crate::window::{How, Window};
+use crate::complete::{self, Completion, Context, Offer};
 use crate::spelling::Spelling;
-use crate::{anchors, attachments, backlinks, devhooks, find::FindBar, links, lists, names, outline, positions, settings, style, theme};
+use crate::{anchors, attachments, backlinks, daily, devhooks, find::FindBar, links, listing, lists, names, outline, positions, settings, style, switcher, theme, vault};
 
 pub struct Editor {
     /// The window the tab is in: dialogs, frames and the title go there.
@@ -79,6 +80,18 @@ pub struct Editor {
     autosave_due: RefCell<Option<glib::SourceId>>,
     /// Spell checking, made the first time it is turned on.
     spelling: RefCell<Option<Spelling>>,
+    /// What the tab shows over its views: the completion list while typing.
+    layer: gtk::Overlay,
+    completion: RefCell<Option<Rc<Completion>>>,
+    /// Where the completion closed with Esc started: it stays closed there.
+    dismissed: Cell<Option<i32>>,
+    /// A look at what is being typed is waiting for the edit (or move) to finish.
+    completing: Cell<bool>,
+    /// Hovering a link to a note in the rendered view: the note waited for or shown, the wait,
+    /// and the popover its start shows in.
+    previewing: RefCell<Option<gio::File>>,
+    preview_due: RefCell<Option<glib::SourceId>>,
+    preview: RefCell<Option<gtk::Popover>>,
     /// The rendered view's side margin (wider with centred text), and a re-render waiting for
     /// the window to stop changing size.
     reader_margin: Cell<i32>,
@@ -145,8 +158,10 @@ impl Editor {
         let stack = gtk::Stack::builder().vexpand(true).hexpand(true).hhomogeneous(false).vhomogeneous(false).build();
         stack.add_named(&edit_scroller, Some("edit"));
         stack.add_named(&read_scroller, Some("read"));
+        // The tab's views, and over them the completion list while typing.
+        let layer = gtk::Overlay::builder().child(&stack).vexpand(true).build();
         let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        page.append(&stack);
+        page.append(&layer);
 
         // The tab: its number, its title, and a close button (a plain "×": icons cost startup
         // time). Ellipsized, so that many tabs share the bar the way browser tabs do.
@@ -197,6 +212,13 @@ impl Editor {
             draft_due: Cell::new(false),
             autosave_due: RefCell::new(None),
             spelling: RefCell::new(None),
+            layer,
+            completion: RefCell::new(None),
+            dismissed: Cell::new(None),
+            completing: Cell::new(false),
+            previewing: RefCell::new(None),
+            preview_due: RefCell::new(None),
+            preview: RefCell::new(None),
             reader_margin: Cell::new(render::MARGIN),
             refit_due: RefCell::new(None),
             fit_queued: Cell::new(false),
@@ -356,6 +378,7 @@ impl Editor {
                     editor.queue_draft();
                     editor.queue_autosave();
                 }
+                editor.queue_completion();
                 // An unsaved note is named after its first line.
                 if editor.location().is_none() {
                     editor.update_tab();
@@ -369,6 +392,7 @@ impl Editor {
         let weak = Rc::downgrade(self);
         click.connect_released(move |gesture, presses, x, y| {
             let Some(editor) = weak.upgrade() else { return };
+            editor.hover(None, 0.0, 0.0);
             if presses == 2 {
                 editor.set_reading(false);
             } else if !editor.reader.buffer().has_selection()
@@ -384,8 +408,15 @@ impl Editor {
         let weak = Rc::downgrade(self);
         motion.connect_motion(move |_, x, y| {
             if let Some(editor) = weak.upgrade() {
-                let cursor = editor.target_at(x, y).map(|_| "pointer");
-                editor.reader.set_cursor_from_name(cursor);
+                let target = editor.target_at(x, y);
+                editor.reader.set_cursor_from_name(target.as_ref().map(|_| "pointer"));
+                editor.hover(target, x, y);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        motion.connect_leave(move |_| {
+            if let Some(editor) = weak.upgrade() {
+                editor.hover(None, 0.0, 0.0);
             }
         });
         self.reader.add_controller(motion);
@@ -395,16 +426,45 @@ impl Editor {
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(self);
         keys.connect_key_pressed(move |_, key, _, state| {
+            let Some(editor) = weak.upgrade() else { return glib::Propagation::Proceed };
             let modifiers = gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK;
+            // The completion list, while it shows, has Up, Down, Enter, Tab and Esc.
+            if editor.completion.borrow().as_ref().is_some_and(|completion| completion.is_open()) && !state.intersects(modifiers) {
+                let handled = match key {
+                    gdk::Key::Up => editor.step_completion(-1),
+                    gdk::Key::Down => editor.step_completion(1),
+                    gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::Tab => editor.accept_completion(),
+                    gdk::Key::Escape => editor.dismiss_completion(),
+                    _ => false,
+                };
+                if handled {
+                    return glib::Propagation::Stop;
+                }
+            }
             if !matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) || state.intersects(modifiers) {
                 return glib::Propagation::Proceed;
             }
-            match weak.upgrade() {
-                Some(editor) if editor.continue_list() => glib::Propagation::Stop,
-                _ => glib::Propagation::Proceed,
-            }
+            if editor.continue_list() { glib::Propagation::Stop } else { glib::Propagation::Proceed }
         });
         self.view.add_controller(keys);
+
+        // Completion follows the typing and the cursor; it closes when the text loses focus.
+        let weak = Rc::downgrade(self);
+        self.buffer.connect_mark_set(move |_, _, mark| {
+            if let Some(editor) = weak.upgrade()
+                && mark.name().as_deref() == Some("insert")
+            {
+                editor.queue_completion();
+            }
+        });
+        let focus = gtk::EventControllerFocus::new();
+        let weak = Rc::downgrade(self);
+        focus.connect_leave(move |_| {
+            if let Some(completion) = weak.upgrade().and_then(|editor| editor.completion.borrow().clone()) {
+                completion.hide();
+            }
+        });
+        self.view.add_controller(focus);
     }
 
     /// The file shown, if any.
@@ -670,7 +730,9 @@ impl Editor {
         let folder = self.location().and_then(|l| l.parent());
         let reader = self.reader.clone();
         let layout = move |text: &str| reader.create_pango_layout(Some(text));
-        let rendered = render::render(&text, folder.as_ref(), theme::scheme().as_ref(), &layout, self.reader_margin.get());
+        let find = |path: &str| self.find(path);
+        let rendered =
+            render::render(&text, folder.as_ref(), &find, theme::scheme().as_ref(), &layout, self.reader_margin.get());
         self.reader.set_buffer(Some(&rendered.buffer));
         for (anchor, widget) in &rendered.children {
             self.reader.add_child_at_anchor(widget, anchor);
@@ -693,14 +755,20 @@ impl Editor {
     /// under the rendered note. Only in a folder window.
     fn find_backlinks(&self) {
         let (Some(host), Some(note)) = (self.host.upgrade(), self.location()) else { return };
-        let Some(root) = host.folder() else { return };
-        let (Some(on_disk), Some(to)) = (root.path(), root.relative_path(&note)) else { return };
+        if host.folder().is_none() {
+            return;
+        }
+        // In the note's vault (the folder holding .obsidian, or the window's folder).
+        let Some((on_disk, files, _)) = self.vault() else { return };
+        let Some(to) = note.path().and_then(|path| path.strip_prefix(&on_disk).ok().map(|to| to.to_path_buf())) else { return };
         let to = to.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        let root = gio::File::for_path(&on_disk);
+        let files: Vec<String> = files.as_ref().clone();
         let search = self.backlink_searches.get() + 1;
         self.backlink_searches.set(search);
         let me = self.me.clone();
         glib::spawn_future_local(async move {
-            let Ok(found) = gio::spawn_blocking(move || backlinks::find(&on_disk, &to)).await else { return };
+            let Ok(found) = gio::spawn_blocking(move || backlinks::find(&on_disk, &to, &files)).await else { return };
             let Some(editor) = me.upgrade() else { return };
             if editor.backlink_searches.get() != search {
                 return;
@@ -840,6 +908,111 @@ impl Editor {
         }
     }
 
+    /// The vault this note is in (or would be, for one not saved yet: the window's folder), its
+    /// files, and the note's folder within it.
+    fn vault(&self) -> Option<(std::path::PathBuf, Rc<Vec<String>>, String)> {
+        let folder = self.location().and_then(|location| location.parent()).and_then(|folder| folder.path());
+        self.vault_near(folder)
+    }
+
+    /// The vault a note in `folder` is in (the window's folder for none), its files, and the
+    /// folder within it.
+    fn vault_near(&self, folder: Option<std::path::PathBuf>) -> Option<(std::path::PathBuf, Rc<Vec<String>>, String)> {
+        let window = self.host.upgrade().and_then(|host| host.folder()).and_then(|folder| folder.path());
+        let folder = folder.or(window.clone())?;
+        let root = vault::root_of(&folder, window.as_deref());
+        let from = folder.strip_prefix(&root).ok()?.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        let files = vault::files(&root);
+        Some((root, files, from))
+    }
+
+    /// The file a link in this note names (its path, decoded), the way Obsidian finds it.
+    fn find(&self, path: &str) -> Option<gio::File> {
+        let (root, files, from) = self.vault()?;
+        vault::resolve(path, &from, &files).map(|found| gio::File::for_path(root.join(found)))
+    }
+
+    /// The pointer is on `target` (or nothing) in the rendered view, at `x`, `y`: resting on a
+    /// link to a note, the note's start shows in a popover after a moment.
+    fn hover(&self, target: Option<Target>, x: f64, y: f64) {
+        let file = match target {
+            Some(Target::Link(url)) if !links::has_scheme(&url) => {
+                let path = links::split(&url).path;
+                (!path.is_empty()).then(|| self.find(&path)).flatten()
+            }
+            Some(Target::File(file)) => Some(file),
+            _ => None,
+        }
+        .filter(is_text);
+        let same = matches!((self.previewing.borrow().as_ref(), file.as_ref()), (Some(a), Some(b)) if a.equal(b));
+        if same {
+            return;
+        }
+        if let Some(waiting) = self.preview_due.take() {
+            waiting.remove();
+        }
+        if let Some(popover) = self.preview.borrow().as_ref() {
+            popover.popdown();
+        }
+        *self.previewing.borrow_mut() = file.clone();
+        let Some(file) = file else { return };
+        let me = self.me.clone();
+        let waiting = glib::timeout_add_local_once(Duration::from_millis(450), move || {
+            if let Some(editor) = me.upgrade() {
+                editor.preview_due.take();
+                editor.show_preview(&file, x, y);
+            }
+        });
+        *self.preview_due.borrow_mut() = Some(waiting);
+    }
+
+    /// The start of the note in `file`, rendered in a popover at `x`, `y`.
+    fn show_preview(&self, file: &gio::File, x: f64, y: f64) {
+        let Ok((bytes, _)) = file.load_contents(None::<&gio::Cancellable>) else { return };
+        let text = String::from_utf8_lossy(&bytes);
+        // Enough to know the note by, not the whole of a long one.
+        let start = text.lines().take(40).collect::<Vec<_>>().join("\n");
+        let view = sourceview::View::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(10)
+            .bottom_margin(10)
+            .build();
+        view.add_css_class("nevis-preview");
+        let folder = file.parent();
+        let near = folder.as_ref().and_then(|folder| folder.path());
+        let find = |path: &str| {
+            let (root, files, from) = self.vault_near(near.clone())?;
+            vault::resolve(path, &from, &files).map(|found| gio::File::for_path(root.join(found)))
+        };
+        let layout = |text: &str| view.create_pango_layout(Some(text));
+        let rendered = render::render(&start, folder.as_ref(), &find, theme::scheme().as_ref(), &layout, 14);
+        view.set_buffer(Some(&rendered.buffer));
+        view.set_left_margin(14);
+        view.set_right_margin(14);
+        for (anchor, widget) in &rendered.children {
+            view.add_child_at_anchor(widget, anchor);
+        }
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&view)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(320)
+            .width_request(460)
+            .build();
+        let mut kept = self.preview.borrow_mut();
+        let popover = kept.get_or_insert_with(|| {
+            let popover = gtk::Popover::builder().autohide(false).can_focus(false).build();
+            popover.add_css_class("nevis-preview-popover");
+            popover.set_parent(&self.reader);
+            popover
+        });
+        popover.set_child(Some(&scroller));
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.popup();
+    }
+
     /// Scrolls the rendered view to the heading a `#…` link names.
     fn jump_to_heading(&self, target: &str) {
         let headings = self.headings.borrow();
@@ -899,12 +1072,13 @@ impl Editor {
             return;
         }
         let Some(host) = self.host.upgrade() else { return };
-        // Relative to this note's folder, or the window's folder for a note not saved yet.
+        // As Obsidian finds it: beside this note, else anywhere in the vault by its name.
+        // A note that doesn't exist yet is made where the link says, beside this one.
         let base = self.location().and_then(|l| l.parent()).or_else(|| host.folder());
-        let file = match base {
+        let file = self.find(&target.path).unwrap_or_else(|| match base {
             Some(folder) => folder.resolve_relative_path(&target.path),
             None => gio::File::for_path(&target.path),
-        };
+        });
         if !is_text(&file) {
             return launch(&self.window, &file.uri());
         }
@@ -1193,6 +1367,15 @@ impl Editor {
         self.buffer.end_user_action();
     }
 
+    /// Replaces the text as one change to undo, the cursor kept about where it was.
+    pub fn replace_text(&self, text: &str) {
+        let at = self.buffer.iter_at_mark(&self.buffer.get_insert()).offset();
+        self.buffer.begin_user_action();
+        self.buffer.set_text(text);
+        self.buffer.end_user_action();
+        self.buffer.place_cursor(&self.buffer.iter_at_offset(at));
+    }
+
     /// Saves a pasted image as a file and links it where the cursor is: in `attachments/`
     /// beside the note, or aside until the note has a file.
     fn paste_image(&self, texture: &gdk::Texture) {
@@ -1207,6 +1390,7 @@ impl Editor {
         if let Err(error) = texture.save_to_png(&path) {
             return alert(&self.window, "Couldn't save the pasted image", &error.to_string());
         }
+        vault::forget();
         let link = match beside {
             Some(_) => attachments::link(&format!("attachments/{name}")),
             None => attachments::link(&path.to_string_lossy()),
@@ -1359,6 +1543,212 @@ impl Editor {
         self.view.set_extra_menu(Some(&menu));
     }
 
+    /// Looks at what is being typed once the current edit or move is done.
+    fn queue_completion(&self) {
+        if self.completing.replace(true) {
+            return;
+        }
+        let me = self.me.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(editor) = me.upgrade() {
+                editor.completing.set(false);
+                editor.update_completion();
+            }
+        });
+    }
+
+    /// Shows what fits what is being typed under the cursor, or nothing.
+    fn update_completion(&self) {
+        let found = (|| {
+            if self.is_reading() || !self.styler.is_enabled() || self.buffer.has_selection() || !self.view.is_focus() {
+                return None;
+            }
+            let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
+            let mut line = cursor;
+            line.set_line_offset(0);
+            let (context, back) = complete::context(&self.buffer.text(&line, &cursor, false))?;
+            let start = cursor.offset() - back as i32;
+            if self.dismissed.get() == Some(start) {
+                return None;
+            }
+            let offers = self.offers(&context);
+            (!offers.is_empty()).then_some((offers, cursor))
+        })();
+        let Some((offers, cursor)) = found else {
+            if let Some(completion) = self.completion.borrow().as_ref() {
+                completion.hide();
+            }
+            return;
+        };
+        let completion = self.completion.borrow_mut().get_or_insert_with(|| {
+            let completion = Completion::new();
+            self.layer.add_overlay(&completion.widget);
+            let me = self.me.clone();
+            completion.on_click(move || {
+                if let Some(editor) = me.upgrade() {
+                    editor.accept_completion();
+                    editor.view.grab_focus();
+                }
+            });
+            completion
+        }).clone();
+        // Under the cursor's line; above it when there's no room below.
+        let rect = self.view.iter_location(&cursor);
+        let (x, y) = self.view.buffer_to_window_coords(gtk::TextWindowType::Widget, rect.x(), rect.y() + rect.height());
+        let point = self.view.compute_point(&self.layer, &gtk::graphene::Point::new(x as f32, y as f32));
+        let (x, y) = point.map_or((x, y), |point| (point.x() as i32, point.y() as i32));
+        let height = 34 * offers.len().min(complete::ROWS) as i32 + 12;
+        let y = if y + height + 8 > self.layer.height() { y - rect.height() - height - 4 } else { y + 4 };
+        let x = x.min(self.layer.width() - 330);
+        completion.show(offers, x, y);
+    }
+
+    /// What fits `context`, best first.
+    fn offers(&self, context: &Context) -> Vec<Offer> {
+        match context {
+            Context::Link(query) => self.link_offers(query),
+            Context::Heading(note, query) => {
+                let text = if note.is_empty() {
+                    Some(self.text())
+                } else {
+                    let path = links::split(note).path;
+                    self.find(&path).and_then(|file| file.load_contents(None::<&gio::Cancellable>).ok()).map(|(bytes, _)| String::from_utf8_lossy(&bytes).into_owned())
+                };
+                let headings: Vec<String> = text.map(|text| outline::headings(&text).into_iter().map(|heading| heading.text).collect()).unwrap_or_default();
+                switcher::rank(query, &headings)
+                    .into_iter()
+                    .take(complete::ROWS)
+                    .map(|i| Offer { markup: complete::markup(&headings[i], ""), text: headings[i].clone() })
+                    .collect()
+            }
+            Context::Tag(query) => {
+                let Some((root, _, _)) = self.vault() else { return Vec::new() };
+                // Read in the background the first time: the list comes once that's done.
+                let me = self.me.clone();
+                let Some(notes) = vault::index(&root, move |_| {
+                    if let Some(editor) = me.upgrade() {
+                        editor.queue_completion();
+                    }
+                }) else {
+                    return Vec::new();
+                };
+                let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for tag in notes.iter().flat_map(|note| note.tags.iter()) {
+                    *counts.entry(tag.trim_start_matches('#').to_owned()).or_default() += 1;
+                }
+                let mut tags: Vec<(String, usize)> = counts.into_iter().collect();
+                tags.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                let names: Vec<String> = tags.iter().map(|(tag, _)| tag.clone()).collect();
+                switcher::rank(query, &names)
+                    .into_iter()
+                    .filter(|&i| names[i] != *query)
+                    .take(complete::ROWS)
+                    .map(|i| Offer { markup: complete::markup(&format!("#{}", names[i]), &tags[i].1.to_string()), text: names[i].clone() })
+                    .collect()
+            }
+            Context::Callout(query) => {
+                let kinds: Vec<String> = complete::CALLOUTS.iter().map(|kind| kind.to_string()).collect();
+                switcher::rank(query, &kinds)
+                    .into_iter()
+                    .take(complete::ROWS)
+                    .map(|i| Offer { markup: complete::markup(&kinds[i], ""), text: format!("{}] ", kinds[i]) })
+                    .collect()
+            }
+        }
+    }
+
+    /// Notes and files of the vault for a `[[` link: notes by name (with their folders when
+    /// another has that name too), and today's, tomorrow's and yesterday's daily notes.
+    fn link_offers(&self, query: &str) -> Vec<Offer> {
+        let Some((root, files, _)) = self.vault() else { return Vec::new() };
+        let entries: Vec<(String, String, String)> = files
+            .iter()
+            .map(|path| {
+                let (folder, file) = path.rsplit_once('/').unwrap_or(("", path));
+                let name = if listing::is_note(file) { file.rsplit_once('.').map_or(file, |(stem, _)| stem) } else { file };
+                (name.to_owned(), folder.to_owned(), path.clone())
+            })
+            .collect();
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (name, _, _) in &entries {
+            *seen.entry(name.to_lowercase()).or_default() += 1;
+        }
+        let mut offers = Vec::new();
+        let lower = query.to_lowercase();
+        if lower.chars().count() >= 2 {
+            let settings = std::fs::read_to_string(root.join(".obsidian/daily-notes.json")).ok();
+            for (word, days) in [("today", 0), ("tomorrow", 1), ("yesterday", -1)] {
+                let Some(day) = glib::DateTime::now_local().ok().and_then(|now| now.add_days(days).ok()) else { continue };
+                if !word.starts_with(&lower) {
+                    continue;
+                }
+                let date = (day.year(), day.month() as u32, day.day_of_month() as u32);
+                let path = daily::path(date, settings.as_deref(), &[]);
+                let name = path.rsplit('/').next().unwrap_or(&path).trim_end_matches(".md").to_owned();
+                offers.push(Offer { markup: complete::markup(&name, word), text: name });
+            }
+        }
+        let names: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
+        for i in switcher::rank(query, &names).into_iter().take(complete::ROWS) {
+            let (name, folder, path) = &entries[i];
+            let text = if seen.get(&name.to_lowercase()).copied().unwrap_or(0) > 1 { path.trim_end_matches(".md").to_owned() } else { name.clone() };
+            offers.push(Offer { markup: complete::markup(name, folder), text });
+        }
+        offers.truncate(complete::ROWS);
+        offers
+    }
+
+    fn step_completion(&self, by: i32) -> bool {
+        if let Some(completion) = self.completion.borrow().as_ref() {
+            completion.step(by);
+        }
+        true
+    }
+
+    /// Puts the chosen completion in place of what was typed for it.
+    fn accept_completion(&self) -> bool {
+        let Some(text) = self.completion.borrow().as_ref().and_then(|completion| completion.chosen()) else { return false };
+        let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
+        let mut line = cursor;
+        line.set_line_offset(0);
+        let Some((context, back)) = complete::context(&self.buffer.text(&line, &cursor, false)) else { return false };
+        let mut start = cursor;
+        start.backward_chars(back as i32);
+        let mut end = cursor;
+        let mut ahead = cursor;
+        ahead.forward_chars(2);
+        let closed = self.buffer.text(&cursor, &ahead, false) == "]]";
+        let link = matches!(context, Context::Link(_) | Context::Heading(..));
+        self.buffer.begin_user_action();
+        self.buffer.delete(&mut start, &mut end);
+        self.buffer.insert(&mut start, &text);
+        if link && !closed {
+            self.buffer.insert(&mut start, "]]");
+        } else if link {
+            start.forward_chars(2);
+        }
+        self.buffer.place_cursor(&start);
+        self.buffer.end_user_action();
+        if let Some(completion) = self.completion.borrow().as_ref() {
+            completion.hide();
+        }
+        true
+    }
+
+    /// Esc: closes the completion until something else is being typed.
+    fn dismiss_completion(&self) -> bool {
+        let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
+        let mut line = cursor;
+        line.set_line_offset(0);
+        if let Some((_, back)) = complete::context(&self.buffer.text(&line, &cursor, false)) {
+            self.dismissed.set(Some(cursor.offset() - back as i32));
+        }
+        if let Some(completion) = self.completion.borrow().as_ref() {
+            completion.hide();
+        }
+        true
+    }
+
     /// With autosave on, saves a file a second after the last change to it.
     fn queue_autosave(self: &Rc<Self>) {
         if !settings::get().autosave || self.location().is_none() {
@@ -1423,7 +1813,7 @@ impl Editor {
         }
     }
 
-    fn text(&self) -> String {
+    pub fn text(&self) -> String {
         self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), false).to_string()
     }
 

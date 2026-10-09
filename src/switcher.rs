@@ -1,12 +1,14 @@
-//! The quick switcher (Ctrl+P): find a file in the folder by typing a few of its letters.
+//! The quick switcher (Ctrl+P): find a file in the folder by typing a few of its letters; the
+//! vault's headings and tags too, once something is typed (`#` first for tags).
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk::{gio, glib, prelude::*};
 
-use crate::{listing, popup};
+use crate::{listing, popup, vault};
 
 /// Most results shown at once.
 const SHOWN: usize = 50;
@@ -21,14 +23,26 @@ pub struct Switcher {
     root: RefCell<Option<gio::File>>,
     /// Files under the root, relative to it.
     paths: RefCell<Vec<String>>,
-    /// Which of `paths` the list shows, in order.
-    shown: RefCell<Vec<usize>>,
-    pick: Box<dyn Fn(gio::File)>,
+    /// What the list shows, in order.
+    shown: RefCell<Vec<Found>>,
+    /// The vault the folder is in, and its notes' headings and tags (read in the background).
+    vault: RefCell<Option<PathBuf>>,
+    index: RefCell<Option<Rc<Vec<vault::Note>>>>,
+    pick: Box<dyn Fn(gio::File, Option<String>)>,
+    tag: Box<dyn Fn(String)>,
+}
+
+/// A row: a file (in `paths`), a heading of a note (its path in the vault, its text), or a tag.
+enum Found {
+    File(usize),
+    Heading(String, String),
+    Tag(String),
 }
 
 impl Switcher {
-    /// `pick` is called with the file the user chose.
-    pub fn new(pick: impl Fn(gio::File) + 'static) -> Rc<Self> {
+    /// `pick` is called with the file the user chose (and the heading in it, if one was);
+    /// `tag` with a tag chosen, to search for.
+    pub fn new(pick: impl Fn(gio::File, Option<String>) + 'static, tag: impl Fn(String) + 'static) -> Rc<Self> {
         let entry = gtk::Entry::builder().placeholder_text("Go to file").build();
         let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
         list.add_css_class("nevis-switcher-list");
@@ -44,7 +58,10 @@ impl Switcher {
             root: RefCell::new(None),
             paths: RefCell::new(Vec::new()),
             shown: RefCell::new(Vec::new()),
+            vault: RefCell::new(None),
+            index: RefCell::new(None),
             pick: Box::new(pick),
+            tag: Box::new(tag),
         });
 
         let weak = Rc::downgrade(&switcher);
@@ -84,8 +101,18 @@ impl Switcher {
         self.widget.set_visible(true);
         self.entry.grab_focus();
         self.refresh();
-        // List the files in the background; the list fills in when that's done.
+        // List the files in the background; the list fills in when that's done. The vault's
+        // headings and tags too.
         let Some(dir) = root.path() else { return };
+        let vault_root = vault::root_of(&dir, Some(&dir));
+        let weak = Rc::downgrade(self);
+        *self.index.borrow_mut() = vault::index(&vault_root, move |notes| {
+            if let Some(s) = weak.upgrade() {
+                *s.index.borrow_mut() = Some(notes);
+                s.refresh();
+            }
+        });
+        *self.vault.borrow_mut() = Some(vault_root);
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let Ok(paths) = gio::spawn_blocking(move || files_under(&dir)).await else { return };
@@ -101,31 +128,90 @@ impl Switcher {
     }
 
     fn refresh(&self) {
-        let ranked: Vec<usize> = rank(&self.entry.text(), &self.paths.borrow()).into_iter().take(SHOWN).collect();
+        let query = self.entry.text().to_string();
+        let paths = self.paths.borrow();
+        let mut shown: Vec<Found> = Vec::new();
+        // Tags first when the query starts with "#"; files then, and headings once typing.
+        let tagging = query.strip_prefix('#');
+        let index = self.index.borrow();
+        let tags = || {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for note in index.iter().flat_map(|notes| notes.iter()) {
+                for tag in &note.tags {
+                    *counts.entry(tag.as_str()).or_default() += 1;
+                }
+            }
+            let mut tags: Vec<(&str, usize)> = counts.into_iter().collect();
+            tags.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            tags.into_iter().map(|(tag, _)| tag.trim_start_matches('#').to_owned()).collect::<Vec<_>>()
+        };
+        if let Some(tag) = tagging {
+            let tags = tags();
+            shown.extend(rank(tag, &tags).into_iter().take(SHOWN).map(|i| Found::Tag(format!("#{}", tags[i]))));
+        }
+        let files = if query.is_empty() { SHOWN } else { 30 };
+        shown.extend(rank(&query, &paths).into_iter().take(files).map(Found::File));
+        if !query.is_empty() && tagging.is_none() {
+            let headings: Vec<(&str, &str)> = index
+                .iter()
+                .flat_map(|notes| notes.iter())
+                .flat_map(|note| note.headings.iter().map(|heading| (note.path.as_str(), heading.as_str())))
+                .collect();
+            let texts: Vec<String> = headings.iter().map(|(_, heading)| heading.to_string()).collect();
+            shown.extend(rank(&query, &texts).into_iter().take(15).map(|i| Found::Heading(headings[i].0.to_owned(), headings[i].1.to_owned())));
+            let tags = tags();
+            shown.extend(rank(&query, &tags).into_iter().take(5).map(|i| Found::Tag(format!("#{}", tags[i]))));
+        }
         while let Some(row) = self.list.first_child() {
             self.list.remove(&row);
         }
-        for &index in &ranked {
+        for found in &shown {
+            let markup = match found {
+                Found::File(index) => row_markup(&paths[*index]),
+                Found::Heading(path, heading) => {
+                    let note = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".md");
+                    format!(
+                        "<span alpha=\"55%\">#</span> {}  <span alpha=\"55%\">{}</span>",
+                        glib::markup_escape_text(heading),
+                        glib::markup_escape_text(note)
+                    )
+                }
+                Found::Tag(tag) => glib::markup_escape_text(tag).to_string(),
+            };
             let label = gtk::Label::builder()
                 .use_markup(true)
-                .label(row_markup(&self.paths.borrow()[index]))
+                .label(markup)
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .build();
             self.list.append(&label);
         }
-        self.list.set_visible(!ranked.is_empty());
+        self.list.set_visible(!shown.is_empty());
         self.list.select_row(self.list.row_at_index(0).as_ref());
-        *self.shown.borrow_mut() = ranked;
+        drop((paths, index));
+        *self.shown.borrow_mut() = shown;
     }
 
     fn choose_selected(&self) {
         let Some(row) = self.list.selected_row() else { return };
-        let path = self.shown.borrow().get(row.index() as usize).map(|&i| self.paths.borrow()[i].clone());
-        let file = path.zip(self.root.borrow().clone()).map(|(path, root)| root.resolve_relative_path(path));
-        if let Some(file) = file {
+        let chosen = match self.shown.borrow().get(row.index() as usize) {
+            Some(Found::File(index)) => {
+                let path = self.paths.borrow()[*index].clone();
+                self.root.borrow().as_ref().map(|root| (root.resolve_relative_path(path), None))
+            }
+            Some(Found::Heading(path, heading)) => {
+                self.vault.borrow().as_ref().map(|vault| (gio::File::for_path(vault.join(path)), Some(heading.clone())))
+            }
+            Some(Found::Tag(tag)) => {
+                let tag = tag.clone();
+                self.hide();
+                return (self.tag)(tag);
+            }
+            None => None,
+        };
+        if let Some((file, heading)) = chosen {
             self.hide();
-            (self.pick)(file);
+            (self.pick)(file, heading);
         }
     }
 }

@@ -42,6 +42,17 @@ Enter continues a list (`- `, `3. ` → `4. `, `- [ ] `) or a quote, and Enter o
 ends it. Click a link to follow it (`[[wiki]]`, relative `.md`, `#heading`, `[[Note#Heading]]`)
 or a checkbox to tick it.
 
+**Links, as in Obsidian.** A `[[link]]` or a relative link opens the note beside this one if
+there is one, and otherwise the note of that name anywhere in the vault (the folder holding
+`.obsidian`, or the folder the window shows), case aside; a path (`[[Projects/Plans]]`) has to
+match whole folder names, and the shortest path wins a tie. Links to notes that don't exist
+yet are fainter; following one starts the note. Resting the pointer on a link in the
+rendered view shows the start of its note. Typing `[[` offers the vault's notes (and today's,
+tomorrow's and yesterday's daily notes), `[[Note#` its headings, `#` the vault's tags and
+`> [!` the callout types: Up and Down choose, Enter or Tab puts it in, Esc closes. Ctrl+P finds
+headings and tags as well as files (`#` first for tags). Renaming a note in the sidebar
+offers to update the links to it, keeping their headings and words.
+
 **Notes.** Ctrl+R lists the note's headings, indented by level: type to narrow them, Enter
 goes there (in either view). In a folder window, Ctrl+D opens today's note,
 `2026-10-08.md`, making it if needed: in a Daily or Journal subfolder if there is one, or
@@ -100,7 +111,7 @@ edits, you're asked), and each file reopens where its cursor was.
 | Ctrl+N | new note: named, in a folder window; elsewhere an empty tab |
 | Ctrl+Shift+N / Ctrl+Shift+W / Ctrl+Q | new window / close window / quit, keeping every tab |
 | Ctrl+O / Ctrl+Shift+O | open file / open folder |
-| Ctrl+B / Ctrl+P / Ctrl+Shift+F | folder sidebar / go to a file / search the folder |
+| Ctrl+B / Ctrl+P / Ctrl+Shift+F | folder sidebar / go to a file, heading or tag / search the folder |
 | Ctrl+S / Ctrl+Shift+S | save / save as |
 | Ctrl+F / Ctrl+H | find / replace (Enter, Shift+Enter, F3, Shift+F3 to move; Esc closes; `Aa` case, `ab` whole words, `.*` regular expressions) |
 | Ctrl+R / Ctrl+D / Ctrl+K | go to a heading / today's note / make a link |
@@ -175,7 +186,7 @@ the source styling only re-tags what changed on each edit.
 cargo test --bin nevis-app      # the pure rules: styling, cursor memory, listing, switcher, anchors,
                                 # links, note names, folder search, math, flowcharts, sessions,
                                 # lists, colours, GTK colours, palettes, outline, daily notes,
-                                # backlinks, pasted images
+                                # backlinks, pasted images, link resolution, renaming, tags
 cargo run --release --example baseline   # an empty GTK4 window: the floor for any GTK app here
 ```
 

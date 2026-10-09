@@ -8,6 +8,7 @@
 //! The window has no header bar or icons (GTK's first icon lookup costs ~300 ms on startup);
 //! the title goes to the compositor, and the menu lives in the right-click menu.
 
+use std::path::PathBuf;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
@@ -23,7 +24,7 @@ use crate::search::Search;
 use crate::session::{self, Session, WindowState};
 use crate::sidebar::Sidebar;
 use crate::switcher::Switcher;
-use crate::{daily, devhooks, help, names, settings, theme};
+use crate::{backlinks, daily, devhooks, help, listing, names, settings, theme, vault};
 
 thread_local! {
     /// Every open window, oldest first.
@@ -670,11 +671,31 @@ impl Window {
         }
     }
 
+    /// Opens the search through the notes of this window's folder on `text` (a tag chosen).
+    fn search_for(self: &Rc<Self>, text: &str) {
+        let Some(root) = self.browsed_folder() else { return };
+        let search = self.search_popup();
+        search.set_query(text);
+        if !search.is_open() {
+            search.show(&root);
+        }
+    }
+
     /// Opens (or closes) the search through the notes of this window's folder, or its file's.
     fn search_folder(self: &Rc<Self>) {
         let Some(root) = self.browsed_folder() else { return };
+        let search = self.search_popup();
+        if search.is_open() {
+            search.hide();
+        } else {
+            search.show(&root);
+        }
+    }
+
+    /// The folder search popup, made the first time.
+    fn search_popup(self: &Rc<Self>) -> Rc<Search> {
         let existing = self.search.borrow().clone();
-        let search = match existing {
+        match existing {
             Some(search) => search,
             None => {
                 let weak = Rc::downgrade(self);
@@ -688,11 +709,6 @@ impl Window {
                 *self.search.borrow_mut() = Some(search.clone());
                 search
             }
-        };
-        if search.is_open() {
-            search.hide();
-        } else {
-            search.show(&root);
         }
     }
 
@@ -704,11 +720,19 @@ impl Window {
             Some(switcher) => switcher,
             None => {
                 let weak = Rc::downgrade(self);
-                let switcher = Switcher::new(move |file| {
-                    if let Some(this) = weak.upgrade() {
-                        this.open(file, None, if ctrl_held() { How::NewTab } else { How::Replace });
-                    }
-                });
+                let tagged = weak.clone();
+                let switcher = Switcher::new(
+                    move |file, heading| {
+                        if let Some(this) = weak.upgrade() {
+                            this.open(file, heading.map(OnLoad::Heading), if ctrl_held() { How::NewTab } else { How::Replace });
+                        }
+                    },
+                    move |tag| {
+                        if let Some(this) = tagged.upgrade() {
+                            this.search_for(&tag);
+                        }
+                    },
+                );
                 self.add_popup(&switcher.widget);
                 *self.switcher.borrow_mut() = Some(switcher.clone());
                 switcher
@@ -792,6 +816,7 @@ impl Window {
             if let Err(error) = file.create(gio::FileCreateFlags::NONE, none) {
                 return alert(&self.window, "Couldn't make today's note", error.message());
             }
+            vault::forget();
         }
         self.open(file, None, How::NewTab);
     }
@@ -921,6 +946,7 @@ impl Window {
                 match file.create(gio::FileCreateFlags::NONE, None::<&gio::Cancellable>) {
                     Ok(stream) => {
                         let _ = stream.close(None::<&gio::Cancellable>);
+                        vault::forget();
                         this.open(file, Some(OnLoad::Edit), How::NewTab);
                     }
                     Err(err) => alert(&this.window, "Could not create the note", err.message()),
@@ -949,8 +975,12 @@ impl Window {
                 if name == unchanged {
                     return;
                 }
+                // A note's links are found while it still has its old name.
+                let window = this.folder().and_then(|folder| folder.path());
+                let linked = (!is_folder && listing::is_note(&unchanged)).then(|| vault_of(&file, window.as_deref())).flatten();
                 match file.set_display_name(&name, None::<&gio::Cancellable>) {
                     Ok(renamed) => {
+                        vault::forget();
                         for open in editors_at_or_under(&file) {
                             let Some(location) = open.location() else { continue };
                             match file.relative_path(&location) {
@@ -958,11 +988,52 @@ impl Window {
                                 None => open.moved_to(&renamed),
                             }
                         }
+                        if let Some((root, old, files)) = linked {
+                            let new = old.rsplit_once('/').map_or(name.clone(), |(folders, _)| format!("{folders}/{name}"));
+                            spawn(this.clone().update_links(root, old, new, files));
+                        }
                     }
                     Err(err) => alert(&this.window, "Could not rename", err.message()),
                 }
             },
         );
+    }
+
+    /// After a note is renamed: offers to point the links to it at its new name. An open note
+    /// with unsaved changes gets the change in its tab; the others are rewritten on disk.
+    async fn update_links(self: Rc<Self>, root: PathBuf, old: String, new: String, files: Vec<String>) {
+        let (searched, wanted, listed) = (root.clone(), old.clone(), files.clone());
+        let Ok(found) = gio::spawn_blocking(move || backlinks::find(&searched, &wanted, &listed)).await else { return };
+        if found.is_empty() {
+            return;
+        }
+        let name = |path: &str| path.rsplit('/').next().unwrap_or(path).trim_end_matches(".md").to_owned();
+        let message = format!("Update the links to “{}”?", name(&old));
+        let detail = match found.len() {
+            1 => format!("1 note links to it. Its links can point at “{}” instead.", name(&new)),
+            count => format!("{count} notes link to it. Their links can point at “{}” instead.", name(&new)),
+        };
+        if choose(&self.window, &message, &detail, &["Leave Them", "Update Links"]).await != Some(1) {
+            return;
+        }
+        for (path, _) in found {
+            let on_disk = root.join(&path);
+            let open = editors_at_or_under(&gio::File::for_path(&on_disk)).into_iter().find(|editor| editor.is_modified());
+            match open {
+                Some(editor) => {
+                    if let Some(text) = vault::relink(&editor.text(), &path, &old, &new, &files) {
+                        editor.replace_text(&text);
+                    }
+                }
+                None => {
+                    let Ok(text) = std::fs::read_to_string(&on_disk) else { continue };
+                    if let Some(text) = vault::relink(&text, &path, &old, &new, &files) {
+                        let _ = std::fs::write(&on_disk, text);
+                    }
+                }
+            }
+        }
+        vault::forget();
     }
 
     /// Moves a file or folder to the trash, after asking.
@@ -974,7 +1045,10 @@ impl Window {
             return;
         }
         match file.trash(None::<&gio::Cancellable>) {
-            Ok(()) => editors_at_or_under(&file).iter().for_each(|open| open.check_disk()),
+            Ok(()) => {
+                vault::forget();
+                editors_at_or_under(&file).iter().for_each(|open| open.check_disk());
+            }
             Err(err) => alert(&self.window, "Could not move it to the trash", err.message()),
         }
     }
@@ -1311,6 +1385,15 @@ fn editors_at_or_under(file: &gio::File) -> Vec<Rc<Editor>> {
         .into_iter()
         .filter(|e| e.location().is_some_and(|l| l.equal(file) || l.has_prefix(file)))
         .collect()
+}
+
+/// The vault `file` is in, its path there, and the vault's files: what renaming it needs to
+/// find the links to it.
+fn vault_of(file: &gio::File, window: Option<&std::path::Path>) -> Option<(PathBuf, String, Vec<String>)> {
+    let path = file.path()?;
+    let root = vault::root_of(path.parent()?, window);
+    let old = path.strip_prefix(&root).ok()?.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    Some((root.clone(), old, vault::files(&root).as_ref().clone()))
 }
 
 /// The names in `folder`.

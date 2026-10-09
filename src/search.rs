@@ -221,6 +221,11 @@ impl Search {
         self.widget.set_visible(false);
     }
 
+    /// Puts `text` in the field (searching for it once shown).
+    pub fn set_query(self: &Rc<Self>, text: &str) {
+        self.entry.set_text(text);
+    }
+
     /// Searches once the typing pauses.
     fn schedule(self: &Rc<Self>) {
         if let Some(waiting) = self.pending.take() {

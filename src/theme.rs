@@ -334,6 +334,11 @@ fn chrome_css(c: &Colors) -> String {
                            padding: 10px; box-shadow: 0 8px 32px alpha(black, 0.5); }}
          .nevis-switcher-list {{ background: transparent; }}
          .nevis-outline-top {{ font-weight: 600; }}
+         .nevis-complete {{ background: {surface}; color: {text}; border: 1px solid {border}; border-radius: 8px; padding: 4px;
+             box-shadow: 0 6px 18px alpha(black, 0.28); }}
+         .nevis-complete-list {{ background: transparent; }}
+         .nevis-complete-list > row {{ padding: 4px 8px; border-radius: 5px; min-height: 0; }}
+         .nevis-complete-list > row:selected {{ background: alpha({accent}, 0.18); color: {accent}; }}
          .nevis-outline-empty {{ color: {dim}; padding: 6px 2px; }}
          .nevis-switcher-list > row {{ padding: 5px 8px; border-radius: 6px; }}
          .nevis-switcher-list > row:selected {{ background: alpha({accent}, 0.16); color: {accent}; }}

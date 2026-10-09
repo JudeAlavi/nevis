@@ -23,7 +23,7 @@ const LEFT: &[(&str, &[Row])] = &[
         row("New window", "app.new-window", ""),
         row("Open a file", "win.open", ""),
         row("Open a folder", "win.open-folder", ""),
-        row("Go to a file in the folder", "win.quick-open", ""),
+        row("Go to a file, heading or #tag", "win.quick-open", ""),
         row("Search in the folder", "win.search", ""),
         row("Save", "win.save", ""),
         row("Save as", "win.save-as", ""),
@@ -66,6 +66,7 @@ const RIGHT: &[(&str, &[Row])] = &[
         row("Today's note (in a folder window)", "win.daily", ""),
         row("Make a link (or paste an address over words)", "win.link", ""),
         row("Paste a screenshot (saved in attachments/)", "", "Ctrl+V"),
+        row("Complete [[links]], #tags, > [!callouts]", "", "Enter / Tab"),
     ]),
     ("Editing", &[
         row("Undo / redo", "", "Ctrl+Z / Shift+Ctrl+Z"),
