@@ -7,7 +7,7 @@ use gtk::{gdk, gio, glib, pango, prelude::*};
 use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use sourceview::prelude::*;
 
-use crate::{flowchart, links, math, obsidian, settings};
+use crate::{flowchart, links, math, obsidian, sequence, settings};
 use crate::theme::{self, fonts};
 
 /// What a click on the rendered text does.
@@ -596,11 +596,15 @@ impl<'m> Renderer<'m> {
                 }
             }
             TagEnd::CodeBlock => {
-                // A flowchart is drawn; other diagrams are shown as their code.
+                // Flowcharts and sequence diagrams are drawn; other diagrams are shown as their code.
                 if let Some(source) = self.mermaid.take() {
                     if let Some(chart) = flowchart::parse(&source) {
                         self.code_language = None;
                         return self.figure(flowchart::picture(&chart, self.text).upcast());
+                    }
+                    if let Some(diagram) = sequence::parse(&source) {
+                        self.code_language = None;
+                        return self.figure(sequence::picture(&diagram, self.text).upcast());
                     }
                     self.code_start = Some(self.buffer.end_iter().offset());
                     self.block.push(self.styles.code_block.clone());

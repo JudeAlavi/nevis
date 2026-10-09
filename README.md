@@ -33,8 +33,8 @@ of the tab in front (when that has no unsaved changes); Ctrl+click opens it in a
 
 **Markdown.** Markdown files open rendered (or as source: Settings): headings, lists, checkboxes, quotes, callouts, code
 with colours, tables, images, links, math (`$…$`, `$$…$$`, drawn as text: symbols, raised and
-lowered scripts, fractions on one line) and Mermaid flowcharts (drawn as diagrams; other
-Mermaid diagrams stay code). Ctrl+E or a double-click switches to the source and back. The
+lowered scripts, fractions on one line) and Mermaid flowcharts and sequence diagrams (drawn
+as diagrams; other Mermaid diagrams stay code). Ctrl+E or a double-click switches to the source and back. The
 source is styled too: headings sized by level, bold/italic/links/code shown as such, the
 markup characters (`#`, `**`, `>`, `](url)`, `$`) dimmed but kept visible, and fenced code
 coloured by its language (```` ```rust ````, ```` ```py ````…), as in the rendered view. In the source,
@@ -49,7 +49,7 @@ without `>`, block ids (`^id`) gone, code blocks without their fences while the 
 outside them. In place of their markup it draws a dot for each `-`, a checkbox for each
 `[ ]` (click it to tick it; the cursor stays where it is), a line for a rule and a callout's
 title in its colour; quotes get a bar beside them and callouts a box behind them. Ticked
-tasks are struck through. Tables, pictures, formulas (`$$…$$`), Mermaid flowcharts and
+tasks are struck through. Tables, pictures, formulas (`$$…$$`), Mermaid diagrams and
 embedded notes (`![[Note]]`) on lines of their own are drawn as in the rendered view, over
 their lines, until the cursor goes into them; a picture in a sentence or a list item is drawn
 under its line. Inline math, HTML and front matter stay as written. Settings → Edit Markdown
@@ -239,4 +239,4 @@ Dev hooks (environment variables, no effect otherwise; `nevis` passes them to `n
 
 ## Next
 
-- Mermaid sequence diagrams.
+- Other Mermaid diagrams (state, class, Gantt); inline formulas drawn in Live Preview.

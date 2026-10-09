@@ -35,9 +35,34 @@ flowchart TD
     s3 & s5 & s7 & s8 --> s9[A longer label that should wrap onto two lines in the box]
 ```
 
-Not a flowchart, so it stays code:
+A sequence diagram: participants and an actor, every kind of arrow, notes, frames, numbers:
 
 ```mermaid
 sequenceDiagram
-    Alice->>Bob: Hello
+    autonumber
+    actor U as User
+    participant A as App
+    participant S as Server
+    U->>A: Open a note
+    A->>S: GET /note
+    S-->>A: 200 OK
+    Note right of A: cached for an hour
+    loop Every 5 minutes
+        A-)S: sync
+    end
+    alt saved
+        A-->>U: Done
+    else failed
+        A-xU: Error
+    end
+    A->>A: tidy up
+    Note over U,S: the end of the day
+```
+
+Neither, so it stays code:
+
+```mermaid
+pie title Pets
+    "Dogs" : 386
+    "Cats" : 85
 ```

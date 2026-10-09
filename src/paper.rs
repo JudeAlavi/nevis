@@ -18,7 +18,7 @@ use sourceview::subclass::prelude::*;
 use crate::render::{self, Look, Panel};
 use crate::style::{Block, Mark};
 use crate::theme::{self, fonts};
-use crate::{devhooks, flowchart};
+use crate::{devhooks, flowchart, sequence};
 
 /// Finds a file a link names (as the rendered view does).
 type Finder = Box<dyn Fn(&str) -> Option<gio::File>>;
@@ -274,8 +274,12 @@ impl Paper {
             Block::Chart => {
                 let fence = |line: &&str| line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~");
                 let code: Vec<&str> = source.lines().skip(1).take_while(|line| !fence(line)).collect();
-                let chart = flowchart::parse(&code.join("\n"))?;
-                let paintable = flowchart::picture(&chart, &text).paintable()?;
+                let code = code.join("\n");
+                let picture = match flowchart::parse(&code) {
+                    Some(chart) => flowchart::picture(&chart, &text),
+                    None => sequence::picture(&sequence::parse(&code)?, &text),
+                };
+                let paintable = picture.paintable()?;
                 let (width, height) = (paintable.intrinsic_width() as f32, paintable.intrinsic_height() as f32);
                 Some(Drawing::Picture(paintable, width, height, true))
             }

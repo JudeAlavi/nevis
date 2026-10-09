@@ -1,5 +1,6 @@
 //! Mermaid flowcharts (```` ```mermaid ```` blocks starting with `flowchart` or `graph`):
-//! read, laid out in ranks along the arrows, and drawn. Other diagram types stay code.
+//! read, laid out in ranks along the arrows, and drawn. Sequence diagrams are in `sequence`;
+//! other diagram types stay code.
 
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
 

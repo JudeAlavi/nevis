@@ -28,6 +28,7 @@ mod paper;
 mod prompt;
 mod render;
 mod search;
+mod sequence;
 mod session;
 mod settings;
 mod spelling;
