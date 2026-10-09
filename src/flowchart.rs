@@ -1,5 +1,6 @@
 //! Mermaid flowcharts (```` ```mermaid ```` blocks starting with `flowchart` or `graph`):
-//! read, laid out in ranks along the arrows, and drawn. Sequence diagrams are in `sequence`;
+//! read, laid out in ranks along the arrows, and drawn, subgraphs as boxes round their nodes.
+//! State diagrams (`state`) are drawn as flowcharts too; sequence diagrams are in `sequence`;
 //! other diagram types stay code.
 
 use gtk::{gdk, graphene, gsk, pango, prelude::*};
@@ -37,6 +38,10 @@ pub enum Shape {
     Slanted,
     /// `>text]`
     Flag,
+    /// A state diagram's start (a dot), end (a ring round a dot), and fork or join (a bar).
+    Start,
+    End,
+    Bar,
 }
 
 #[derive(Debug, PartialEq)]
@@ -82,6 +87,16 @@ pub struct Chart {
     pub direction: Direction,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    /// Subgraphs (states inside a state): a box round their nodes, outer ones first.
+    pub groups: Vec<Group>,
+}
+
+/// A subgraph: its name, and the nodes (indices) mentioned in it or in one inside it (each in
+/// the first subgraph that mentions it, and those round that one).
+#[derive(Debug, PartialEq)]
+pub struct Group {
+    pub label: String,
+    pub members: Vec<usize>,
 }
 
 /// A box on the canvas, in pixels from its top left corner.
@@ -195,7 +210,9 @@ pub fn layout(chart: &Chart, sizes: &[(f64, f64)], labels: &[(f64, f64)]) -> Lay
                 2 => {
                     let twins: Vec<usize> = (0..chains.len()).filter(|&other| chains[other] == *chain).collect();
                     let nth = twins.iter().position(|&other| other == index).unwrap_or(0);
-                    let aside = (nth as f64 - (twins.len() - 1) as f64 / 2.0) * TWIN_GAP;
+                    // Side by side, each as wide as its label (TWIN_GAP at least).
+                    let widths: Vec<f64> = twins.iter().map(|&twin| (turned(labels[twin]).0 + 2.0 * LABEL_ROOM).max(TWIN_GAP)).collect();
+                    let aside = widths[..nth].iter().sum::<f64>() + widths[nth] / 2.0 - widths.iter().sum::<f64>() / 2.0;
                     let middle = ((points[0].0 + points[1].0) / 2.0 + aside, (upper.y + upper.height + lower.y) / 2.0);
                     if aside != 0.0 {
                         points.insert(1, middle);
@@ -357,7 +374,7 @@ fn outline_towards(shape: Shape, rect: Rect, toward: (f64, f64)) -> (f64, f64) {
     }
     let (a, b) = (rect.width / 2.0, rect.height / 2.0);
     let reach = match shape {
-        Shape::Circle => a.min(b) / dx.hypot(dy),
+        Shape::Circle | Shape::Start | Shape::End => a.min(b) / dx.hypot(dy),
         Shape::Diamond => 1.0 / (dx.abs() / a + dy.abs() / b),
         // Close enough for the other shapes: their box.
         _ => (a / dx.abs()).min(b / dy.abs()),
@@ -486,11 +503,16 @@ pub fn picture(chart: &Chart, text: &dyn Fn(&str) -> pango::Layout) -> gtk::Pict
     };
     let nodes: Vec<_> = chart.nodes.iter().map(|node| labelled(&node.label)).collect();
     let edges: Vec<_> = chart.edges.iter().map(|edge| (!edge.label.is_empty()).then(|| labelled(&edge.label))).collect();
+    // A bar lies across the way the arrows run.
+    let across = matches!(chart.direction, Direction::Right | Direction::Left);
     let sizes: Vec<(f64, f64)> = chart
         .nodes
         .iter()
         .zip(&nodes)
-        .map(|(node, (_, extents))| outer_size(node.shape, extents.width() as f64, extents.height() as f64))
+        .map(|(node, (_, extents))| {
+            let (width, height) = outer_size(node.shape, extents.width() as f64, extents.height() as f64);
+            if node.shape == Shape::Bar && across { (height, width) } else { (width, height) }
+        })
         .collect();
     let label_sizes: Vec<(f64, f64)> = edges
         .iter()
@@ -502,6 +524,26 @@ pub fn picture(chart: &Chart, text: &dyn Fn(&str) -> pango::Layout) -> gtk::Pict
     let (line, border, fill, ink, ground) =
         (color(&theme::colors().dim.to_hex()), color(&theme::colors().marker.to_hex()), color(&theme::colors().quote_background.to_hex()), color(&theme::colors().text.to_hex()), color(&theme::colors().background.to_hex()));
     let snapshot = gtk::Snapshot::new();
+    // Subgraphs: a box round each one's nodes and the boxes inside it, its name at its top; the
+    // picture grows to hold them.
+    let boxes = group_boxes(chart, &laid);
+    let (left, top) = boxes.iter().fold((0.0f32, 0.0f32), |(x, y), (rect, _)| (x.min(rect.x()), y.min(rect.y())));
+    let (right, bottom) = boxes
+        .iter()
+        .fold((laid.width as f32, laid.height as f32), |(x, y), (rect, _)| (x.max(rect.x() + rect.width()), y.max(rect.y() + rect.height())));
+    snapshot.translate(&graphene::Point::new(-left, -top));
+    for (rect, group) in &boxes {
+        let outline = gsk::RoundedRect::from_rect(*rect, 8.0);
+        snapshot.push_rounded_clip(&outline);
+        snapshot.append_color(&gdk::RGBA::new(fill.red(), fill.green(), fill.blue(), 0.5), rect);
+        snapshot.pop();
+        snapshot.append_border(&outline, &[1.0; 4], &[border; 4]);
+        let name = text(&chart.groups[*group].label);
+        snapshot.save();
+        snapshot.translate(&graphene::Point::new(rect.x() + 10.0, rect.y() + 4.0));
+        snapshot.append_layout(&name, &color(&theme::colors().dim.to_hex()));
+        snapshot.restore();
+    }
     let write = |layout: &pango::Layout, extents: &pango::Rectangle, (x, y): (f64, f64), ink: &gdk::RGBA| {
         snapshot.save();
         let left = x - extents.width() as f64 / 2.0 - extents.x() as f64;
@@ -518,9 +560,23 @@ pub fn picture(chart: &Chart, text: &dyn Fn(&str) -> pango::Layout) -> gtk::Pict
     }
     for ((node, rect), (layout, extents)) in chart.nodes.iter().zip(&laid.nodes).zip(&nodes) {
         let outline = outline(node.shape, *rect);
-        snapshot.append_fill(&outline, gsk::FillRule::Winding, &fill);
-        snapshot.append_stroke(&outline, &gsk::Stroke::new(1.2), &border);
-        write(layout, extents, (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0 + cylinder_drop(node.shape)), &ink);
+        match node.shape {
+            // A state diagram's start, and a fork or a join: solid.
+            Shape::Start | Shape::Bar => snapshot.append_fill(&outline, gsk::FillRule::Winding, &ink),
+            // Its end: a ring round a dot.
+            Shape::End => {
+                snapshot.append_stroke(&outline, &gsk::Stroke::new(1.4), &ink);
+                let dot = gsk::PathBuilder::new();
+                let centre = graphene::Point::new((rect.x + rect.width / 2.0) as f32, (rect.y + rect.height / 2.0) as f32);
+                dot.add_circle(&centre, (rect.width.min(rect.height) / 2.0 - 4.0) as f32);
+                snapshot.append_fill(&dot.to_path(), gsk::FillRule::Winding, &ink);
+            }
+            _ => {
+                snapshot.append_fill(&outline, gsk::FillRule::Winding, &fill);
+                snapshot.append_stroke(&outline, &gsk::Stroke::new(1.2), &border);
+                write(layout, extents, (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0 + cylinder_drop(node.shape)), &ink);
+            }
+        }
     }
     // Edge labels last, on a patch of the background.
     for ((edge, route), label) in chart.edges.iter().zip(&laid.edges).zip(&edges) {
@@ -535,15 +591,39 @@ pub fn picture(chart: &Chart, text: &dyn Fn(&str) -> pango::Layout) -> gtk::Pict
         }
     }
 
-    let picture = match snapshot.to_paintable(Some(&graphene::Size::new(laid.width as f32, laid.height as f32))) {
+    let (wide, tall) = (f64::from(right - left), f64::from(bottom - top));
+    let picture = match snapshot.to_paintable(Some(&graphene::Size::new(wide as f32, tall as f32))) {
         Some(paintable) => gtk::Picture::for_paintable(&paintable),
         None => gtk::Picture::new(),
     };
     picture.set_can_shrink(true);
-    let width = laid.width.min(WIDEST);
-    picture.set_size_request(width as i32, (laid.height * width / laid.width.max(1.0)) as i32);
+    let width = wide.min(WIDEST);
+    picture.set_size_request(width as i32, (tall * width / wide.max(1.0)) as i32);
     picture.set_alternative_text(Some("Flowchart"));
     picture
+}
+
+/// Room round a subgraph's nodes in its box, and above them for its name.
+const GROUP_PAD: f32 = 12.0;
+const GROUP_NAME: f32 = 20.0;
+
+/// Each subgraph's box (and its index), outer ones first: round its nodes and the boxes of
+/// the subgraphs inside it.
+fn group_boxes(chart: &Chart, laid: &Layout) -> Vec<(graphene::Rect, usize)> {
+    // Inner ones first: an outer box holds them.
+    let mut order: Vec<usize> = (0..chart.groups.len()).filter(|&group| !chart.groups[group].members.is_empty()).collect();
+    order.sort_by_key(|&group| chart.groups[group].members.len());
+    let mut boxes: Vec<(graphene::Rect, usize)> = Vec::new();
+    for group in order {
+        let members = &chart.groups[group].members;
+        let inside = boxes.iter().filter(|(_, other)| chart.groups[*other].members.iter().all(|member| members.contains(member))).map(|(rect, _)| *rect);
+        let nodes = members.iter().filter_map(|&member| laid.nodes.get(member)).map(|rect| graphene::Rect::new(rect.x as f32, rect.y as f32, rect.width as f32, rect.height as f32));
+        let Some(round) = nodes.chain(inside).reduce(|a, b| a.union(&b)) else { continue };
+        let rect = graphene::Rect::new(round.x() - GROUP_PAD, round.y() - GROUP_PAD - GROUP_NAME, round.width() + 2.0 * GROUP_PAD, round.height() + 2.0 * GROUP_PAD + GROUP_NAME);
+        boxes.push((rect, group));
+    }
+    boxes.reverse();
+    boxes
 }
 
 /// A node's size around a label `width` × `height`.
@@ -557,6 +637,10 @@ fn outer_size(shape: Shape, width: f64, height: f64) -> (f64, f64) {
         Shape::Slanted => (w + 2.0 * SLANT, h),
         Shape::Flag => (w + 14.0, h),
         Shape::Hexagon => (w + h, h),
+        // No label: a dot, a ring, a bar (across the way the arrows run; see `picture`).
+        Shape::Start => (16.0, 16.0),
+        Shape::End => (20.0, 20.0),
+        Shape::Bar => (70.0, 7.0),
         // Round the label's box.
         Shape::Circle => {
             let diameter = width.hypot(height) + 2.0 * PAD_Y;
@@ -600,7 +684,8 @@ fn outline(shape: Shape, rect: Rect) -> gsk::Path {
                 path.line_to(side, y + h);
             }
         }
-        Shape::Circle => path.add_circle(&graphene::Point::new(cx, cy), w.min(h) / 2.0),
+        Shape::Circle | Shape::Start | Shape::End => path.add_circle(&graphene::Point::new(cx, cy), w.min(h) / 2.0),
+        Shape::Bar => path.add_rounded_rect(&rounded(2.0)),
         Shape::Diamond => polygon(&[(cx, y), (x + w, cy), (cx, y + h), (x, cy)]),
         Shape::Hexagon => {
             let inset = h / 2.0;
@@ -721,13 +806,42 @@ pub fn parse(source: &str) -> Option<Chart> {
         Some("BT") => Direction::Up,
         _ => Direction::Down,
     };
-    let mut chart = Chart { direction, nodes: Vec::new(), edges: Vec::new() };
+    let mut chart = Chart { direction, nodes: Vec::new(), edges: Vec::new(), groups: Vec::new() };
+    // Subgraphs open: a node mentioned in one belongs to it, and to those round it (the first
+    // to mention it keeps it).
+    let mut open: Vec<usize> = Vec::new();
+    let mut placed = std::collections::HashSet::new();
     for statement in std::iter::once(rest).chain(lines).flat_map(statements) {
-        // Styling, interaction and grouping: nothing to draw here (a group's nodes still are).
-        let first = statement.split_whitespace().next().unwrap_or_default();
-        let skipped = ["classDef", "class", "style", "linkStyle", "click", "subgraph", "end", "direction", "accTitle", "accDescr"];
-        if !statement.starts_with("%%") && !skipped.contains(&first) {
-            chart.statement(statement);
+        let (first, rest) = statement.split_once(char::is_whitespace).map_or((statement, ""), |(first, rest)| (first, rest.trim()));
+        match first {
+            // `subgraph id [Title]`, `subgraph id`, `subgraph "Title"`.
+            "subgraph" => {
+                let name = match rest.find('[').filter(|_| rest.ends_with(']')) {
+                    Some(bracket) => label(&rest[bracket + 1..rest.len() - 1]),
+                    None => label(rest),
+                };
+                chart.groups.push(Group { label: name, members: Vec::new() });
+                open.push(chart.groups.len() - 1);
+            }
+            "end" => {
+                open.pop();
+            }
+            // Styling and interaction: nothing to draw.
+            "classDef" | "class" | "style" | "linkStyle" | "click" | "direction" | "accTitle" | "accDescr" => {}
+            _ if statement.starts_with("%%") => {}
+            _ => {
+                let mentioned = chart.statement(statement);
+                if open.is_empty() {
+                    continue;
+                }
+                for node in mentioned {
+                    if placed.insert(node) {
+                        for &group in &open {
+                            chart.groups[group].members.push(node);
+                        }
+                    }
+                }
+            }
         }
     }
     Some(chart)
@@ -753,10 +867,11 @@ fn statements(line: &str) -> impl Iterator<Item = &str> {
 }
 
 impl Chart {
-    /// Reads one line: nodes, and the links between them.
-    fn statement(&mut self, line: &str) {
+    /// Reads one line: nodes, and the links between them. The nodes it mentions.
+    fn statement(&mut self, line: &str) -> Vec<usize> {
         let mut scan = Scanner { text: line, at: 0 };
         let mut previous = self.node_group(&mut scan);
+        let mut mentioned = previous.clone();
         while !previous.is_empty() {
             scan.skip_spaces();
             let Some(link) = scan.link() else { break };
@@ -767,8 +882,10 @@ impl Chart {
                     self.edges.push(Edge { from, to, ..link.clone() });
                 }
             }
+            mentioned.extend(&next);
             previous = next;
         }
+        mentioned
     }
 
     /// One node, or several joined by `&`; their indices.
@@ -943,7 +1060,7 @@ impl<'a> Scanner<'a> {
 }
 
 /// A label as it shows: without its quotes, `<br>` as a new line.
-fn label(raw: &str) -> String {
+pub fn label(raw: &str) -> String {
     let text = raw.trim();
     let text = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(text);
     let text = text.strip_prefix('`').and_then(|t| t.strip_suffix('`')).unwrap_or(text);
@@ -1044,6 +1161,14 @@ mod tests {
     }
 
     #[test]
+    fn subgraphs_hold_the_nodes_mentioned_in_them() {
+        let chart = parse("flowchart TD\nA --> B\nsubgraph one [The first]\n  B --> C\n  subgraph inner\n    D\n  end\nend\nC --> E").unwrap();
+        let group = |label: &str, members: &[usize]| Group { label: label.to_owned(), members: members.to_vec() };
+        // B was named before, outside: mentioned in the subgraph, it is drawn in it (as Mermaid does).
+        assert_eq!(chart.groups, vec![group("The first", &[1, 2, 3]), group("inner", &[3])]);
+    }
+
+    #[test]
     fn groups_semicolons_quotes_and_lines_that_draw_nothing() {
         let chart = parse(
             "flowchart TD;
@@ -1128,6 +1253,14 @@ mod tests {
         let right = laid_out(&parse("graph LR\nA -- label --> B").unwrap());
         let (a, b, (x, _)) = (right.nodes[0], right.nodes[1], right.edges[0].label);
         assert!(a.x + a.width <= x - 25.0 && x + 25.0 <= b.x);
+    }
+
+    #[test]
+    fn labels_of_arrows_both_ways_between_two_nodes_sit_side_by_side() {
+        // Two 50-wide labels, one on each arrow between A and B.
+        let laid = laid_out(&parse("graph TD\nA -- push --> B\nB -- stop --> A").unwrap());
+        let ((x1, _), (x2, _)) = (laid.edges[0].label, laid.edges[1].label);
+        assert!((x1 - x2).abs() >= 50.0);
     }
 
     #[test]

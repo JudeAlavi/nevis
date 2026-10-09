@@ -7,7 +7,7 @@ use gtk::{gdk, gio, glib, pango, prelude::*};
 use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use sourceview::prelude::*;
 
-use crate::{flowchart, links, math, obsidian, sequence, settings};
+use crate::{flowchart, links, math, obsidian, sequence, settings, state};
 use crate::theme::{self, fonts};
 
 /// What a click on the rendered text does.
@@ -618,6 +618,10 @@ impl<'m> Renderer<'m> {
                 // Flowcharts and sequence diagrams are drawn; other diagrams are shown as their code.
                 if let Some(source) = self.mermaid.take() {
                     if let Some(chart) = flowchart::parse(&source) {
+                        self.code_language = None;
+                        return self.figure(flowchart::picture(&chart, self.text).upcast());
+                    }
+                    if let Some(chart) = state::parse(&source) {
                         self.code_language = None;
                         return self.figure(flowchart::picture(&chart, self.text).upcast());
                     }

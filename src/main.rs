@@ -33,6 +33,7 @@ mod sequence;
 mod session;
 mod settings;
 mod spelling;
+mod state;
 mod sidebar;
 mod style;
 mod switcher;

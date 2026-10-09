@@ -59,7 +59,25 @@ sequenceDiagram
     Note over U,S: the end of the day
 ```
 
-Neither, so it stays code:
+A state diagram: a start, an end, a note, and a state with states inside:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Still
+    Still --> [*]
+    Still --> Moving : push
+    Moving --> Still : stop
+    Moving --> Crash
+    Crash --> [*]
+    note right of Moving : on wheels
+    state Crash {
+        [*] --> Dented
+        Dented --> Towed
+        Towed --> [*]
+    }
+```
+
+None of those, so it stays code:
 
 ```mermaid
 pie title Pets

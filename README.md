@@ -33,8 +33,8 @@ of the tab in front (when that has no unsaved changes); Ctrl+click opens it in a
 
 **Markdown.** Markdown files open rendered (or as source: Settings): headings, lists, checkboxes, quotes, callouts, code
 with colours, tables, images, links, math (`$…$`, `$$…$$`, drawn as text: symbols, raised and
-lowered scripts, fractions on one line) and Mermaid flowcharts and sequence diagrams (drawn
-as diagrams; other Mermaid diagrams stay code). Ctrl+E or a double-click switches to the source and back. The
+lowered scripts, fractions on one line) and Mermaid flowcharts (subgraphs boxed), state
+diagrams and sequence diagrams (drawn as diagrams; other Mermaid diagrams stay code). Ctrl+E or a double-click switches to the source and back. The
 source is styled too: headings sized by level, bold/italic/links/code shown as such, the
 markup characters (`#`, `**`, `>`, `](url)`, `$`) dimmed but kept visible, and fenced code
 coloured by its language (```` ```rust ````, ```` ```py ````…), as in the rendered view. In the source,
@@ -245,4 +245,4 @@ Dev hooks (environment variables, no effect otherwise; `nevis` passes them to `n
 
 ## Next
 
-- Other Mermaid diagrams (state, class, Gantt).
+- Other Mermaid diagrams (class, Gantt).
