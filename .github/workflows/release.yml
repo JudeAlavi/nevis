@@ -2,7 +2,7 @@
 #   ./release.sh 0.2.0                # sets the version, commits it and tags v0.2.0
 #   git push origin main v0.2.0       # then this builds the release and publishes it
 # The release gets nevis-<version>-x86_64-linux.tar.gz (both programs, built on Ubuntu 24.04
-# so they run there and on newer systems, with install.sh) and its SHA-256 sum.
+# so they run there and on newer systems, with install.sh and the licence) and its SHA-256 sum.
 name: Release
 
 on:
@@ -43,7 +43,7 @@ jobs:
           mkdir -p "$name/bin" "$name/data"
           cp target/release/nevis target/release/nevis-app "$name/bin/"
           cp data/*.in "$name/data/"
-          cp install.sh README.md "$name/"
+          cp install.sh README.md LICENSE "$name/"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 

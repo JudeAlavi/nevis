@@ -6,7 +6,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc='Fast, minimal text and Markdown editor; Persian and other right-to-left text per paragraph'
 arch=('x86_64')
-license=('LicenseRef-none') # no license chosen yet
+license=('MIT')
 depends=('gtk4' 'gtksourceview5' 'glib2' 'pango' 'cairo' 'gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=('vazirmatn-fonts: Persian text in its intended font'
@@ -42,4 +42,5 @@ package() {
   sed 's|@BINDIR@|/usr/bin|' "$_tree/data/nevis.service.in" |
     install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/nevis.service"
   install -Dm644 "$_tree/README.md" "$pkgdir/usr/share/doc/nevis/README.md"
+  install -Dm644 "$_tree/LICENSE" "$pkgdir/usr/share/licenses/nevis/LICENSE"
 }
