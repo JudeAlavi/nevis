@@ -395,12 +395,23 @@ impl Paper {
         layout
     }
 
-    /// The checkbox drawn at `x`, `y` (in the view), as the range of its "[ ]".
+    /// The checkbox drawn at `x`, `y` (in the view), as the range of its "[ ]". Told by where the
+    /// box is drawn: next to hidden text, GTK names the wrong character at a box's edges.
     pub fn task_at(&self, x: f64, y: f64) -> Option<Range<usize>> {
         let (x, y) = self.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-        let at = self.iter_at_location(x, y)?.offset() as usize;
+        let buffer = self.buffer();
         let marks = self.imp().marks.borrow();
-        marks.iter().find(|(range, mark)| matches!(mark, Mark::Task(_)) && range.contains(&at)).map(|(range, _)| range.clone())
+        marks
+            .iter()
+            .filter(|(_, mark)| matches!(mark, Mark::Task(_)))
+            .find(|(range, _)| {
+                let start = buffer.iter_at_offset(range.start as i32);
+                let line = place(self, &start);
+                let (left, width) = span(self, &start, &buffer.iter_at_offset(range.end as i32));
+                let (x, y) = (x as f32, y);
+                x >= left - 2.0 && x <= left + width + 2.0 && y >= line.y() && y < line.y() + line.height()
+            })
+            .map(|(range, _)| range.clone())
     }
 }
 
