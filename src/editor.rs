@@ -36,11 +36,11 @@ pub struct Editor {
     hovered: Cell<bool>,
     /// Holds the source editor ("edit") and the rendered view ("read").
     stack: gtk::Stack,
-    view: sourceview::View,
+    view: crate::paper::Paper,
     pub buffer: sourceview::Buffer,
     /// Styles Markdown in the source view.
     styler: Rc<style::Styler>,
-    reader: crate::reader::Reader,
+    reader: crate::paper::Paper,
     /// Location, encoding and line endings of the file on disk.
     file: sourceview::File,
     /// Watches the file for changes made by other programs.
@@ -122,7 +122,9 @@ impl Editor {
         buffer.set_style_scheme(theme::scheme().as_ref());
         let styler = style::Styler::new(&buffer);
 
-        let view = sourceview::View::with_buffer(&buffer);
+        let view = crate::paper::Paper::new();
+        view.set_buffer(Some(&buffer));
+        styler.draw_on(&view);
         view.add_css_class("nevis-editor");
         let preferences = settings::get();
         view.set_wrap_mode(if preferences.wrap { gtk::WrapMode::WordChar } else { gtk::WrapMode::None });
@@ -141,7 +143,7 @@ impl Editor {
         view.set_show_line_numbers(preferences.line_numbers);
         view.set_extra_menu(Some(&crate::window::menu_model()));
 
-        let reader = crate::reader::Reader::new();
+        let reader = crate::paper::Paper::new();
         reader.add_css_class("nevis-read");
         reader.set_editable(false);
         reader.set_cursor_visible(false);
@@ -489,6 +491,30 @@ impl Editor {
             }
         });
         self.view.add_controller(drag);
+        // Live Preview: a click on a checkbox ticks it, the cursor staying where it is.
+        let tick = gtk::GestureClick::builder().button(gdk::BUTTON_PRIMARY).propagation_phase(gtk::PropagationPhase::Capture).build();
+        let weak = Rc::downgrade(self);
+        tick.connect_pressed(move |gesture, presses, x, y| {
+            let Some(editor) = weak.upgrade() else { return };
+            let modifiers = gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK;
+            if presses != 1 || gesture.current_event_state().intersects(modifiers) {
+                return;
+            }
+            if let Some(task) = editor.view.task_at(x, y) {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                editor.styler.set_dragging(false);
+                editor.tick(task);
+            }
+        });
+        self.view.add_controller(tick);
+        let pointer = gtk::EventControllerMotion::new();
+        let weak = Rc::downgrade(self);
+        pointer.connect_motion(move |_, x, y| {
+            if let Some(editor) = weak.upgrade() {
+                editor.view.set_cursor_from_name(Some(if editor.view.task_at(x, y).is_some() { "pointer" } else { "text" }));
+            }
+        });
+        self.view.add_controller(pointer);
         self.styler.set_live(settings::get().live_preview);
         let focus = gtk::EventControllerFocus::new();
         let weak = Rc::downgrade(self);
@@ -522,7 +548,7 @@ impl Editor {
         self.find
             .borrow_mut()
             .get_or_insert_with(|| {
-                let bar = FindBar::new(&self.view, &self.buffer);
+                let bar = FindBar::new(self.view.upcast_ref(), &self.buffer);
                 self.page.prepend(&bar.widget);
                 bar
             })
@@ -1011,7 +1037,7 @@ impl Editor {
         let text = String::from_utf8_lossy(&bytes);
         // Enough to know the note by, not the whole of a long one.
         let start = text.lines().take(40).collect::<Vec<_>>().join("\n");
-        let view = crate::reader::Reader::new();
+        let view = crate::paper::Paper::new();
         view.set_editable(false);
         view.set_cursor_visible(false);
         view.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -1098,6 +1124,18 @@ impl Editor {
                 }
             }
         }
+    }
+
+    /// Ticks the task whose "[ ]" is at `task` (characters), or unticks it, as one undo step.
+    fn tick(&self, task: Range<usize>) {
+        let mut start = self.buffer.iter_at_offset(task.start as i32 + 1);
+        let mut end = start;
+        end.forward_char();
+        let ticked = start.char() != ' ';
+        self.buffer.begin_user_action();
+        self.buffer.delete(&mut start, &mut end);
+        self.buffer.insert(&mut start, if ticked { " " } else { "x" });
+        self.buffer.end_user_action();
     }
 
     /// Flips a `[ ]` / `[x]` checkbox in the source and re-renders in place.
@@ -1950,7 +1988,7 @@ struct Reload {
 pub fn warm_up() {
     let source = sourceview::View::new();
     source.add_css_class("nevis-editor");
-    let reader = crate::reader::Reader::new();
+    let reader = crate::paper::Paper::new();
     reader.add_css_class("nevis-read");
     // A tab bar with a tab, as windows with two tabs or more show.
     let tab = gtk::Box::new(gtk::Orientation::Horizontal, 4);

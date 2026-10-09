@@ -91,7 +91,7 @@ pub fn callout(line: &str) -> Option<Callout> {
     let kind = KINDS.iter().find(|(_, names)| names.contains(&lower.as_str())).map_or("note", |(kind, _)| kind);
     let title = match title.trim() {
         "" => {
-            let mut letters = written.chars();
+            let mut letters = lower.chars();
             letters.next().map(|first| first.to_uppercase().chain(letters).collect()).unwrap_or_default()
         }
         title => title.to_owned(),
@@ -272,6 +272,7 @@ mod tests {
         assert_eq!(callout("[!FAQ]- Why?"), callout_of("question", "Why?", Some(false)));
         assert_eq!(callout("[!todo]+"), callout_of("todo", "Todo", Some(true)));
         assert_eq!(callout("[!caution] Hot"), callout_of("warning", "Hot", None));
+        assert_eq!(callout("[!WARNING]"), callout_of("warning", "Warning", None));
     }
 
     #[test]

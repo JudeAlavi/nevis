@@ -46,7 +46,10 @@ or a checkbox to tick it.
 on the lines with the cursor or the selection, as in Obsidian: headings without their `#`s,
 **bold** without its `**`, ==highlights== without their `==`, links as their words, quotes
 without `>`, block ids (`^id`) gone, code blocks without their fences while the cursor is
-outside them. Tables, math, rules, HTML and front matter stay as written. Settings → Edit Markdown as → Source shows all of it, styled.
+outside them. In place of their markup it draws a dot for each `-`, a checkbox for each
+`[ ]` (click it to tick it; the cursor stays where it is), a line for a rule and a callout's
+title in its colour; quotes get a bar beside them and callouts a box behind them. Ticked
+tasks are struck through. Tables, math, HTML and front matter stay as written. Settings → Edit Markdown as → Source shows all of it, styled.
 
 **Links, as in Obsidian.** A `[[link]]` or a relative link opens the note beside this one if
 there is one, and otherwise the note of that name anywhere in the vault (the folder holding

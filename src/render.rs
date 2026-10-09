@@ -81,8 +81,9 @@ pub struct Rendered {
     pub panels: Vec<Panel>,
 }
 
-/// A block drawn on a panel behind its text (by `reader::Reader`): from `start`'s line to
-/// `end`'s, `inset` pixels in from the view's sides.
+/// A block drawn on a panel behind its text (by `paper::Paper`): from `start`'s line to
+/// `end`'s, `inset` pixels in from the text's edges (the view's margins; into them if less
+/// than 0).
 pub struct Panel {
     pub start: gtk::TextMark,
     pub end: gtk::TextMark,
@@ -271,6 +272,9 @@ struct Renderer<'m> {
     text: &'m dyn Fn(&str) -> pango::Layout,
     /// The view's side margin, which indents add to.
     margin: i32,
+    /// The margin of the view itself (an embedded note's `margin` is further in): panels are
+    /// placed from it.
+    origin: i32,
     buffer: sourceview::Buffer,
     styles: Styles,
     /// Tags for everything inserted now: block-level ones, then inline ones.
@@ -324,6 +328,7 @@ impl<'m> Renderer<'m> {
             panels: Vec::new(),
             open: Vec::new(),
             left: margin,
+            origin: margin,
             list_base: 0,
             frame: None,
             frames: HashMap::new(),
@@ -780,6 +785,7 @@ impl<'m> Renderer<'m> {
         let (shown, additions) = prepare(&part);
         let mut nested = Renderer::new(file.parent().as_ref(), self.find, self.buffer.clone(), self.text, self.left);
         nested.depth = self.depth + 1;
+        nested.origin = self.origin;
         nested.read(&shown, additions);
         nested.frame = self.frame.clone();
         for (event, range) in events(&shown) {
@@ -1108,7 +1114,7 @@ impl<'m> Renderer<'m> {
             None => self.left,
         };
         let start = self.buffer.create_mark(None, &self.buffer.end_iter(), true);
-        self.panels.push(Panel { start: start.clone(), end: start, inset: edge, look, rtl: false, fold: None });
+        self.panels.push(Panel { start: start.clone(), end: start, inset: edge - self.origin, look, rtl: false, fold: None });
         self.open.push(Open {
             panel: self.panels.len() - 1,
             blocks: self.block.len(),
@@ -1343,13 +1349,13 @@ fn section(text: &str, heading: &str) -> String {
 }
 
 /// A theme colour as GDK's, `alpha` opaque.
-fn rgba(color: crate::color::Rgb, alpha: f32) -> gdk::RGBA {
+pub fn rgba(color: crate::color::Rgb, alpha: f32) -> gdk::RGBA {
     gdk::RGBA::new(color.r as f32, color.g as f32, color.b as f32, alpha)
 }
 
 /// A callout kind's colour, from the theme: blue for notes, green for success, yellow for
 /// questions, orange for warnings, red for failures and bugs…
-fn callout_color(kind: &str) -> crate::color::Rgb {
+pub fn callout_color(kind: &str) -> crate::color::Rgb {
     let c = theme::colors();
     match kind {
         "abstract" | "tip" => c.function,

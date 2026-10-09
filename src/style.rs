@@ -11,6 +11,7 @@ use gtk::{gdk, glib, pango, prelude::*};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Tag, TagEnd};
 
 use crate::devhooks;
+use crate::paper::Paper;
 use crate::theme;
 use crate::{obsidian, render};
 
@@ -93,6 +94,10 @@ pub struct Styler {
     /// last (what is hidden is worked out from them), the lines being edited when it was, and
     /// whether it waits (typing through an input method, dragging a selection).
     hide: gtk::TextTag,
+    /// Live Preview draws on this view (dots, checkboxes, rules and titles over the text,
+    /// quote bars and callout boxes behind it); the tag keeps the text under a drawing unseen.
+    paper: RefCell<Option<Paper>>,
+    clear: gtk::TextTag,
     live: Cell<bool>,
     styled: RefCell<Option<(String, Spans)>>,
     editing: Cell<Option<(usize, usize)>>,
@@ -113,9 +118,14 @@ impl Styler {
             .collect();
         let hide = gtk::TextTag::builder().invisible(true).build();
         table.add(&hide);
+        // Not quite 0: Pango takes an alpha of 0 as none given, and draws the text opaque.
+        let clear = gtk::TextTag::builder().foreground_rgba(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.001)).build();
+        table.add(&clear);
         let styler = Rc::new(Self {
             buffer: buffer.clone(),
             hide,
+            paper: RefCell::new(None),
+            clear,
             live: Cell::new(false),
             styled: RefCell::new(None),
             editing: Cell::new(None),
@@ -146,7 +156,13 @@ impl Styler {
     pub fn set_live(&self, on: bool) {
         self.live.set(on);
         self.editing.set(None);
+        self.update_panels();
         self.rehide();
+    }
+
+    /// Live Preview draws on `paper`, the view showing the buffer.
+    pub fn draw_on(&self, paper: &Paper) {
+        *self.paper.borrow_mut() = Some(paper.clone());
     }
 
     /// The cursor or the selection moved: the lines shown as written may change.
@@ -188,17 +204,61 @@ impl Styler {
         }
         let editing = self.editing_lines();
         self.editing.set(editing);
-        let want = match (&*self.styled.borrow(), editing) {
-            (Some((text, spans)), Some((first, last))) if self.live.get() && self.enabled.get() => hidden(text, spans, first..=last),
+        let (want, marks) = match (&*self.styled.borrow(), editing) {
+            (Some((text, spans)), Some((first, last))) if self.live.get() && self.enabled.get() => {
+                (hidden(text, spans, first..=last), drawn(text, spans, first..=last))
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        self.retag(&self.hide, &want);
+        // Under a drawing the text stays, unseen (a title's line is hidden instead).
+        let under: Vec<Range<usize>> = marks.iter().map(|(range, _)| range.clone()).filter(|range| !range.is_empty()).collect();
+        self.retag(&self.clear, &under);
+        if let Some(paper) = &*self.paper.borrow() {
+            paper.set_marks(marks);
+        }
+    }
+
+    /// Puts `tag` on `want` (sorted character ranges) and nowhere else, changing only what
+    /// differs.
+    fn retag(&self, tag: &gtk::TextTag, want: &[Range<usize>]) {
+        let have = tagged(&self.buffer, tag);
+        for range in subtract(&have, want) {
+            self.buffer.remove_tag(tag, &self.iter_at(range.start), &self.iter_at(range.end));
+        }
+        for range in subtract(want, &have) {
+            self.buffer.apply_tag(tag, &self.iter_at(range.start), &self.iter_at(range.end));
+        }
+    }
+
+    /// Live Preview's panels for the quotes and callouts styled last: a bar or a box out in
+    /// the margins, the text staying where it is. None when it's off.
+    fn update_panels(&self) {
+        let Some(paper) = self.paper.borrow().clone() else { return };
+        let panels = match &*self.styled.borrow() {
+            Some((text, spans)) if self.live.get() && self.enabled.get() => panels(text, spans),
             _ => Vec::new(),
         };
-        let have = tagged(&self.buffer, &self.hide);
-        for range in subtract(&have, &want) {
-            self.buffer.remove_tag(&self.hide, &self.iter_at(range.start), &self.iter_at(range.end));
-        }
-        for range in subtract(&want, &have) {
-            self.buffer.apply_tag(&self.hide, &self.iter_at(range.start), &self.iter_at(range.end));
-        }
+        let accent = theme::colors().accent;
+        let panels = panels
+            .into_iter()
+            .map(|(range, kind)| {
+                let (start, end) = (self.iter_at(range.start), self.iter_at(range.end));
+                let rtl = pango::find_base_dir(&self.buffer.text(&start, &end, false)) == pango::Direction::Rtl;
+                render::Panel {
+                    start: self.buffer.create_mark(None, &start, true),
+                    end: self.buffer.create_mark(None, &end, false),
+                    inset: -12,
+                    look: match kind {
+                        Some(kind) => render::Look::Box(render::rgba(render::callout_color(kind), 0.10)),
+                        None => render::Look::Bar(render::rgba(accent, 0.7)),
+                    },
+                    rtl,
+                    fold: None,
+                }
+            })
+            .collect();
+        paper.set_panels(panels);
     }
 
     /// Whether `iter` is inside a code block or the front matter, where text is taken as is.
@@ -262,27 +322,14 @@ impl Styler {
         }
         let wanted = spans(&text);
         for (kind, tag) in ALL.iter().zip(&self.tags) {
-            let have = tagged(&self.buffer, tag);
-            let want = wanted.of(*kind);
-            for range in subtract(&have, want) {
-                self.buffer.remove_tag(tag, &self.iter_at(range.start), &self.iter_at(range.end));
-            }
-            for range in subtract(want, &have) {
-                self.buffer.apply_tag(tag, &self.iter_at(range.start), &self.iter_at(range.end));
-            }
+            self.retag(tag, wanted.of(*kind));
         }
         self.colour_code(wanted.fences());
         if let Some(tag) = self.unspelled.borrow().as_ref() {
-            let want = unspelled(&text, &wanted);
-            let have = tagged(&self.buffer, tag);
-            for range in subtract(&have, &want) {
-                self.buffer.remove_tag(tag, &self.iter_at(range.start), &self.iter_at(range.end));
-            }
-            for range in subtract(&want, &have) {
-                self.buffer.apply_tag(tag, &self.iter_at(range.start), &self.iter_at(range.end));
-            }
+            self.retag(tag, &unspelled(&text, &wanted));
         }
         *self.styled.borrow_mut() = Some((text.to_string(), wanted.clone()));
+        self.update_panels();
         self.rehide();
         if devhooks::active() {
             devhooks::lap(&format!("markdown styled in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0));
@@ -310,6 +357,11 @@ impl Styler {
         }
         self.styled.borrow_mut().take();
         self.buffer.remove_tag(&self.hide, &start, &end);
+        self.buffer.remove_tag(&self.clear, &start, &end);
+        self.update_panels();
+        if let Some(paper) = &*self.paper.borrow() {
+            paper.set_marks(Vec::new());
+        }
         self.uncolour();
     }
 
@@ -544,11 +596,7 @@ impl Spans {
 /// link with no words. Character ranges, sorted, never across a line's end.
 pub fn hidden(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<usize>) -> Vec<Range<usize>> {
     let chars: Vec<char> = source.chars().collect();
-    let mut starts = vec![0];
-    starts.extend(chars.iter().enumerate().filter(|(_, c)| **c == '\n').map(|(i, _)| i + 1));
-    let line = |n: usize| starts.get(n).copied().unwrap_or(chars.len() + 1);
-    let edited = line(*editing.start())..line(editing.end() + 1);
-    let overlap = |a: &Range<usize>, b: &Range<usize>| a.start < b.end && b.start < a.end;
+    let edited = lines(&chars, &editing);
     // A code block with an edited line shows whole, fences and all.
     let blocks: Vec<&Range<usize>> = spans.of(Kind::CodeBlock).iter().filter(|block| overlap(block, &edited)).collect();
     let kept: Vec<&Range<usize>> =
@@ -575,8 +623,113 @@ pub fn hidden(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<usi
             hidden.push(start..range.end);
         }
     }
+    // A task's "- " (its checkbox takes the place), and a callout's first line (its title is
+    // drawn instead).
+    for marker in spans.of(Kind::ListMarker) {
+        if is_bullet(&chars, marker) && task_after(&chars, marker.end).is_some() && !overlap(marker, &edited) {
+            hidden.push(marker.start..marker.end + 1);
+        }
+    }
+    for quote in spans.of(Kind::Quote) {
+        if let Some((header, _)) = callout_header(&chars, quote)
+            && !overlap(&header, &edited)
+        {
+            hidden.push(header);
+        }
+    }
     hidden.sort_by_key(|range| range.start);
     hidden
+}
+
+/// What Live Preview draws in place of markup away from the lines `editing`, as `hidden` hides
+/// it: a dot for a list's "-", a checkbox for a task's "[ ]" (ticked with any mark), a line for
+/// a rule; the text under them stays, unseen. A callout's first line (hidden) gets its title,
+/// at its start. Character ranges, sorted.
+pub fn drawn(source: &str, spans: &Spans, editing: std::ops::RangeInclusive<usize>) -> Vec<(Range<usize>, Mark)> {
+    let chars: Vec<char> = source.chars().collect();
+    let edited = lines(&chars, &editing);
+    let mut marks = Vec::new();
+    for marker in spans.of(Kind::ListMarker) {
+        // "1. [ ]" keeps its number and gets a checkbox too.
+        match task_after(&chars, marker.end) {
+            Some((task, done)) => marks.push((task, Mark::Task(done))),
+            None if is_bullet(&chars, marker) => marks.push((marker.clone(), Mark::Bullet)),
+            None => {}
+        }
+    }
+    for kept in spans.as_written() {
+        let line: String = chars[kept.clone()].iter().collect();
+        let rule = line.trim_end_matches(['\n', '\r']);
+        let first = rule.trim_start().chars().next();
+        let drawn = rule.chars().filter(|c| !c.is_whitespace()).count();
+        if matches!(first, Some('-' | '*' | '_')) && drawn >= 3 && rule.chars().all(|c| c.is_whitespace() || Some(c) == first) {
+            marks.push((kept.start..kept.start + rule.chars().count(), Mark::Rule));
+        }
+    }
+    for quote in spans.of(Kind::Quote) {
+        if let Some((header, callout)) = callout_header(&chars, quote) {
+            marks.push((header.start..header.start, Mark::Title(callout.title, callout.kind)));
+        }
+    }
+    marks.retain(|(range, _)| {
+        // A title is drawn over its hidden line: whether that is edited counts.
+        let line = range.start..range.end.max(range.start + 1);
+        !overlap(&line, &edited)
+    });
+    marks.sort_by_key(|(range, _)| range.start);
+    marks
+}
+
+/// The quotes in `source` (styled as `spans`), each with its callout kind if it is one: Live
+/// Preview draws a bar down a quote's side and a callout on a box. Character ranges.
+pub fn panels(source: &str, spans: &Spans) -> Vec<(Range<usize>, Option<&'static str>)> {
+    let chars: Vec<char> = source.chars().collect();
+    spans.of(Kind::Quote).iter().map(|quote| (quote.clone(), callout_header(&chars, quote).map(|(_, callout)| callout.kind))).collect()
+}
+
+/// The character range of the lines `editing` in `chars` (to the start of the next line).
+fn lines(chars: &[char], editing: &std::ops::RangeInclusive<usize>) -> Range<usize> {
+    let mut starts = vec![0];
+    starts.extend(chars.iter().enumerate().filter(|(_, c)| **c == '\n').map(|(i, _)| i + 1));
+    let line = |n: usize| starts.get(n).copied().unwrap_or(chars.len() + 1);
+    line(*editing.start())..line(editing.end() + 1)
+}
+
+fn overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+/// Whether a list marker is a bullet ("-", "*", "+"), not a number.
+fn is_bullet(chars: &[char], marker: &Range<usize>) -> bool {
+    marker.len() == 1 && matches!(chars[marker.start], '-' | '*' | '+')
+}
+
+/// The "[ ]" after a list marker ending at `at`, any mark in it, and whether it is ticked.
+fn task_after(chars: &[char], at: usize) -> Option<(Range<usize>, bool)> {
+    let &[' ', '[', mark, ']'] = chars.get(at..at + 4)? else { return None };
+    let ends = chars.get(at + 4).is_none_or(|c| c.is_whitespace());
+    (ends && mark != '\n').then_some((at + 1..at + 4, mark != ' '))
+}
+
+/// A quote's first line, if it starts a callout: where it is after its ">"s, and the callout.
+fn callout_header(chars: &[char], quote: &Range<usize>) -> Option<(Range<usize>, obsidian::Callout)> {
+    let end = (quote.start..quote.end).find(|&i| chars[i] == '\n').unwrap_or(quote.end);
+    let start = (quote.start..end).find(|&i| !matches!(chars[i], '>' | ' ' | '\t')).unwrap_or(end);
+    let line: String = chars[start..end].iter().collect();
+    obsidian::callout(&line).map(|callout| (start..end, callout))
+}
+
+/// Something Live Preview draws (see `drawn`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mark {
+    /// A list item's "-", "*" or "+": a dot.
+    Bullet,
+    /// A task's "[ ]": a checkbox, ticked or not.
+    Task(bool),
+    /// A rule's "---": a line across.
+    Rule,
+    /// A callout's first line: its title, in its kind's colour.
+    Title(String, &'static str),
 }
 
 /// Works out how each part of `source` should look.
@@ -662,6 +815,19 @@ pub fn spans(source: &str) -> Spans {
             }
             Event::TaskListMarker(_) => out.push(Kind::Task, range),
             _ => {}
+        }
+    }
+    // A ticked task's text, struck through as in the rendered view: any mark but a space.
+    for marker in out.ranges[Kind::ListMarker as usize].clone() {
+        let rest = &source[marker.end..];
+        let ticked = rest.strip_prefix(" [").and_then(|rest| {
+            let mut chars = rest.chars();
+            let mark = chars.next()?;
+            chars.as_str().strip_prefix("] ").filter(|_| !matches!(mark, ' ' | '\n'))
+        });
+        if let Some(text) = ticked {
+            let start = source.len() - text.len();
+            out.push(Kind::Strike, start..start + text.find('\n').unwrap_or(text.len()));
         }
     }
     // Obsidian's additions: highlights (their == dimmed, hidden in Live Preview like other
@@ -974,6 +1140,12 @@ mod tests {
     }
 
     #[test]
+    fn a_ticked_tasks_text_is_struck_through_whatever_its_mark() {
+        let s = spans("- [x] done\n- [ ] open\n- [?] asked\n");
+        assert_eq!(s.of(Kind::Strike), &[6..10, 28..33]);
+    }
+
+    #[test]
     fn quote_lines_are_quoted_and_their_markers_dimmed() {
         let s = spans("> hello\n> world\n");
         assert_eq!(s.of(Kind::Quote), &[0..15]);
@@ -1024,6 +1196,35 @@ mod tests {
         let s = spans(text);
         assert_eq!(hidden(text, &s, 9..=9), vec![0..7, 19..22]);
         assert_eq!(hidden(text, &s, 1..=1), Vec::<Range<usize>>::new());
+    }
+
+    /// `text` without what `hidden` hides.
+    fn shown(text: &str, hidden: &[Range<usize>]) -> String {
+        text.chars().enumerate().filter(|(i, _)| !hidden.iter().any(|h| h.contains(i))).map(|(_, c)| c).collect()
+    }
+
+    #[test]
+    fn live_preview_draws_bullets_checkboxes_and_rules_away_from_the_cursor() {
+        let text = "- one\n- [ ] two\n- [x] three\n- [?] four\n\n---\n\n1. five\n* six";
+        let s = spans(text);
+        assert_eq!(
+            drawn(text, &s, 1..=1),
+            vec![(0..1, Mark::Bullet), (18..21, Mark::Task(true)), (30..33, Mark::Task(true)), (40..43, Mark::Rule), (53..54, Mark::Bullet)]
+        );
+        // A task's checkbox stands where its "-" was.
+        assert_eq!(shown(text, &hidden(text, &s, 1..=1)), "- one\n- [ ] two\n[x] three\n[?] four\n\n---\n\n1. five\n* six");
+    }
+
+    #[test]
+    fn live_preview_draws_a_callouts_title_over_its_first_line_and_quotes_on_panels() {
+        let text = "- [ ] a\n- [ ] b\n\n> [!tip] Title\n> body\n\n> [!NOTE]\n> GitHub's kind\n\n> plain";
+        let s = spans(text);
+        assert_eq!(shown(text, &hidden(text, &s, 1..=1)), "[ ] a\n- [ ] b\n\n\nbody\n\n\nGitHub's kind\n\nplain");
+        assert_eq!(
+            drawn(text, &s, 1..=1),
+            vec![(2..5, Mark::Task(false)), (19..19, Mark::Title("Title".into(), "tip")), (42..42, Mark::Title("Note".into(), "note"))]
+        );
+        assert_eq!(panels(text, &s), vec![(17..38, Some("tip")), (40..65, Some("note")), (67..74, None)]);
     }
 
     #[test]
