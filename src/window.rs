@@ -1228,9 +1228,8 @@ pub fn open_files(app: &gtk::Application, files: &[gio::File]) {
     if nothing_open && in_tabs {
         // Set to open files in tabs: the last session comes back, and they join it.
         restore_or_new(app);
-    } else if nothing_open && DORMANT.with_borrow(|dormant| dormant.is_empty()) && session::enabled() {
-        // With no window open, the session on disk is how nevis was left: set it aside, kept.
-        DORMANT.set(session::load().windows);
+    } else if nothing_open {
+        set_aside_last_session();
     }
     let (folders, files): (Vec<&gio::File>, Vec<&gio::File>) = files.iter().partition(|file| {
         file.query_file_type(gio::FileQueryInfoFlags::NONE, None::<&gio::Cancellable>) == gio::FileType::Directory
@@ -1277,10 +1276,21 @@ pub fn open_files(app: &gtk::Application, files: &[gio::File]) {
 
 /// A new window, with an empty note.
 pub fn new_window(app: &gtk::Application) {
+    if WINDOWS.with_borrow(|windows| windows.is_empty()) {
+        set_aside_last_session();
+    }
     let window = Window::new(app);
     window.new_tab();
     window.window.present();
     devhooks::content_ready(&window.window);
+}
+
+/// With no window open, the session on disk is how nevis was left: set aside, kept, so a new
+/// window's session doesn't replace it (and drop its drafts).
+fn set_aside_last_session() {
+    if DORMANT.with_borrow(|dormant| dormant.is_empty()) && session::enabled() {
+        DORMANT.set(session::load().windows);
+    }
 }
 
 /// Ctrl+Q: every window closes, every tab is kept for next time.
@@ -1382,8 +1392,11 @@ fn keep_everything() {
             editor.keep_draft_now();
         }
     }
-    if session::enabled() {
-        session::store(&snapshot());
+    // With no window left (the last one closed, then nevis was stopped, as logging out does),
+    // the session written when it closed stands: an empty one would drop its drafts.
+    let session = snapshot();
+    if session::enabled() && !session.windows.is_empty() {
+        session::store(&session);
     }
     // All of it is on disk now, set-aside windows included.
     DORMANT.take();
