@@ -848,7 +848,7 @@ impl Editor {
         let find = |path: &str| self.find(path);
         let rendered =
             render::render(&text, folder.as_ref(), &find, theme::scheme().as_ref(), &layout, self.reader_margin.get());
-        self.reader.set_buffer(Some(&rendered.buffer));
+        self.reader.show_buffer(&rendered.buffer);
         self.reader.set_panels(rendered.panels);
         for (anchor, widget) in &rendered.children {
             self.reader.add_child_at_anchor(widget, anchor);

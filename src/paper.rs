@@ -125,6 +125,18 @@ impl Paper {
         glib::Object::new()
     }
 
+    /// Shows `buffer` instead of the one shown now, emptied first. A view changing buffers
+    /// keeps the lines GTK laid out but never measured (`place` asks about lines off screen);
+    /// once the old buffer is freed they point at nothing, and the next frame or change
+    /// crashes. Deleted text GTK forgets.
+    pub fn show_buffer(&self, buffer: &impl IsA<gtk::TextBuffer>) {
+        let old = self.buffer();
+        if &old != buffer.upcast_ref::<gtk::TextBuffer>() {
+            old.delete(&mut old.start_iter(), &mut old.end_iter());
+            self.set_buffer(Some(buffer));
+        }
+    }
+
     /// Draws `panels`, marked in the buffer shown now, behind the text (the marks of those
     /// drawn before go).
     pub fn set_panels(&self, panels: Vec<Panel>) {
