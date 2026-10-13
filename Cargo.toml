@@ -1,6 +1,6 @@
 [package]
 name = "nevis"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A fast, minimal text and Markdown editor (GTK4 + GtkSourceView)"
 license = "MIT"
