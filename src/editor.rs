@@ -138,10 +138,11 @@ impl Editor {
         view.set_wrap_mode(if preferences.wrap { gtk::WrapMode::WordChar } else { gtk::WrapMode::None });
         view.set_left_margin(16);
         view.set_right_margin(16);
-        view.set_top_margin(10);
-        view.set_bottom_margin(10);
-        view.set_pixels_above_lines(2);
-        view.set_pixels_below_lines(2);
+        // Lines are spaced above only: GTK aborts on a click or a drag in the space under a
+        // line holding hidden text (Live Preview's markup; see `Paper::iter_at`).
+        view.set_top_margin(8);
+        view.set_bottom_margin(12);
+        view.set_pixels_above_lines(4);
         view.set_pixels_inside_wrap(2);
         view.set_highlight_current_line(true);
         view.set_auto_indent(true);
@@ -286,7 +287,7 @@ impl Editor {
             let Some(spelling) = spelling.as_ref() else { return };
             if !editor.buffer.has_selection() {
                 let (bx, by) = editor.view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-                if let Some(iter) = editor.view.iter_at_location(bx, by) {
+                if let Some(iter) = editor.view.iter_at(bx, by) {
                     editor.buffer.place_cursor(&iter);
                 }
             }
@@ -1160,7 +1161,7 @@ impl Editor {
 
     fn target_at(&self, x: f64, y: f64) -> Option<Target> {
         let (bx, by) = self.reader.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-        let iter = self.reader.iter_at_location(bx, by)?;
+        let iter = self.reader.iter_at(bx, by)?;
         let targets = self.targets.borrow();
         targets.iter().find(|(tag, _)| iter.has_tag(tag)).map(|(_, target)| target.clone())
     }
@@ -1215,7 +1216,7 @@ impl Editor {
     /// a tag: then true): in Live Preview on a line not being edited, or with `ctrl`.
     fn followable_at(&self, x: f64, y: f64, ctrl: bool) -> Option<(usize, bool)> {
         let (bx, by) = self.view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-        let iter = self.view.iter_at_location(bx, by)?;
+        let iter = self.view.iter_at(bx, by)?;
         // Past a line's end isn't on it.
         if iter.ends_line() || !(ctrl || (self.styler.is_live() && !self.styler.is_editing(iter.line() as usize))) {
             return None;

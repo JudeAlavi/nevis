@@ -137,6 +137,19 @@ impl Paper {
         }
     }
 
+    /// The text at `x`, `y` (buffer coordinates), as `iter_at_location` without its crash: in
+    /// the space under a line holding hidden text (Live Preview's markup, a fold), GTK counts
+    /// the hidden bytes as shown and aborts, the index off the end of the line. So `y` is
+    /// kept above that space, on the line's last row of text.
+    pub fn iter_at(&self, x: i32, y: i32) -> Option<gtk::TextIter> {
+        let (mut end, _) = self.line_at_y(y);
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        let last = self.iter_location(&end);
+        self.iter_at_location(x, y.min(last.y() + (last.height() - 1).max(0)))
+    }
+
     /// Draws `panels`, marked in the buffer shown now, behind the text (the marks of those
     /// drawn before go).
     pub fn set_panels(&self, panels: Vec<Panel>) {
@@ -305,10 +318,19 @@ impl Paper {
             for tag in imp.rooms.borrow().values() {
                 buffer.remove_tag(tag, &start, &end);
             }
+            // Room under a line is kept above the next one instead where it can be: GTK aborts on
+            // a click or a drag in the space under a line holding hidden text (see `iter_at`).
+            let tops: Vec<usize> = applied.iter().filter(|(_, _, under)| !under).map(|(range, _, _)| range.start).collect();
             for &(ref range, keep, under) in applied.iter().filter(|(_, keep, _)| *keep > 0) {
-                let first = buffer.iter_at_offset(range.start as i32);
+                let mut first = buffer.iter_at_offset(range.start as i32);
                 let mut next = first;
                 next.forward_line();
+                let mut under = under;
+                if under && !next.is_end() && !tops.contains(&(next.offset() as usize)) {
+                    first = next;
+                    next.forward_line();
+                    under = false;
+                }
                 let tag = imp
                     .rooms
                     .borrow_mut()
@@ -579,11 +601,14 @@ fn draw_blocks(view: &Paper, blocks: &[(Range<usize>, Rc<Drawing>)], rows: &[Row
     let room = (seen.width() - view.left_margin() - view.right_margin()) as f32;
     let colors = theme::colors();
     for (line, pictures, keep) in rows {
-        let (y, height) = view.line_yrange(&buffer.iter_at_offset(line.start as i32));
-        if y > seen.y() + seen.height() || y + height < seen.y() {
+        let (y, _) = view.line_yrange(&buffer.iter_at_offset(line.start as i32));
+        // Under the line's text, whether its room is under it or above the next line.
+        let end = place(view, &buffer.iter_at_offset(line.end as i32));
+        let bottom = end.y() + end.height();
+        if y > seen.y() + seen.height() || bottom + keep < seen.y() {
             continue;
         }
-        let top = (y + height - keep + ABOVE) as f32;
+        let top = (bottom + ABOVE) as f32;
         let mut x = left;
         for (picture, (width, tall)) in pictures.iter().zip(row(pictures, room)) {
             if let Drawing::Picture(paintable, ..) = picture.as_ref() {
@@ -726,7 +751,7 @@ fn draw_marks(view: &Paper, marks: &[(Range<usize>, Mark)], snapshot: &gtk::Snap
     }
     let buffer = view.buffer();
     let seen = view.visible_rect();
-    let offset = |x: i32, y: i32| view.iter_at_location(x, y).map(|iter| iter.offset() as usize);
+    let offset = |x: i32, y: i32| view.iter_at(x, y).map(|iter| iter.offset() as usize);
     let first = offset(seen.x(), seen.y()).unwrap_or(0);
     let last = offset(seen.x() + seen.width(), seen.y() + seen.height()).unwrap_or(usize::MAX);
     let from = marks.partition_point(|(range, _)| range.end < first);
