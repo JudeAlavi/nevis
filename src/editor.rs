@@ -398,7 +398,8 @@ impl Editor {
             }
         });
 
-        // Rendered view: click a link or checkbox to follow it, double-click to edit.
+        // Rendered view: click a link or checkbox to follow it (a code block, to copy it),
+        // double-click to edit.
         let click = gtk::GestureClick::new();
         click.set_button(gdk::BUTTON_PRIMARY);
         let weak = Rc::downgrade(self);
@@ -422,6 +423,8 @@ impl Editor {
             if let Some(editor) = weak.upgrade() {
                 let target = editor.target_at(x, y);
                 editor.reader.set_cursor_from_name(target.as_ref().map(|_| "pointer"));
+                let copies = matches!(target, Some(Target::Copy(_)));
+                editor.reader.set_tooltip_text(copies.then_some("Click to copy"));
                 editor.hover(target, x, y);
             }
         });
@@ -1166,6 +1169,21 @@ impl Editor {
         targets.iter().find(|(tag, _)| iter.has_tag(tag)).map(|(_, target)| target.clone())
     }
 
+    /// "Copied", over the bottom of the tab for a moment.
+    fn show_copied(&self) {
+        let label = gtk::Label::builder()
+            .label("Copied")
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::End)
+            .margin_bottom(24)
+            .can_target(false)
+            .css_classes(["nevis-toast"])
+            .build();
+        self.layer.add_overlay(&label);
+        let layer = self.layer.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1200), move || layer.remove_overlay(&label));
+    }
+
     fn follow(self: &Rc<Self>, target: Target, new_tab: bool) {
         match target {
             Target::Task(range) => self.toggle_task(range),
@@ -1179,6 +1197,10 @@ impl Editor {
                 if let Some(host) = self.host.upgrade() {
                     host.search_for(&tag);
                 }
+            }
+            Target::Copy(code) => {
+                self.reader.clipboard().set_text(&code);
+                self.show_copied();
             }
             Target::Fold(fold) => {
                 let opening = fold.is_invisible();

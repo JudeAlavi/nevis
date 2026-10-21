@@ -23,6 +23,8 @@ pub enum Target {
     Tag(String),
     /// A foldable callout's header: clicking shows or hides the body this tag hides.
     Fold(gtk::TextTag),
+    /// A code block: clicking copies its text.
+    Copy(String),
 }
 
 /// Markdown features nevis understands, shared by the read view and the source styling.
@@ -644,6 +646,13 @@ impl<'m> Renderer<'m> {
                 self.end_line();
                 self.block.pop();
                 if let Some(start) = self.code_start.take() {
+                    // A click on the block copies its code (the fences left out).
+                    let (from, to) = (self.buffer.iter_at_offset(start), self.buffer.end_iter());
+                    let code = self.buffer.text(&from, &to, false);
+                    let copy = gtk::TextTag::new(None);
+                    self.buffer.tag_table().add(&copy);
+                    self.buffer.apply_tag(&copy, &from, &to);
+                    self.targets.push((copy, Target::Copy(code.strip_suffix('\n').unwrap_or(&code).to_owned())));
                     let first = self.buffer.create_mark(None, &self.buffer.iter_at_offset(start), true);
                     let last = self.buffer.create_mark(None, &self.buffer.end_iter(), true);
                     let look = Look::Box(rgba(theme::colors().code_background, 1.0));
