@@ -94,6 +94,10 @@ pub struct Editor {
     previewing: RefCell<Option<gio::File>>,
     preview_due: RefCell<Option<glib::SourceId>>,
     preview: RefCell<Option<gtk::Popover>>,
+    /// A code block clicked, copied once the click can't be a double-click (to edit).
+    copy_due: RefCell<Option<glib::SourceId>>,
+    /// "Copied", shown, and when it goes.
+    copied: RefCell<Option<(gtk::Label, glib::SourceId)>>,
     /// The rendered view's side margin (wider with centred text), and a re-render waiting for
     /// the window to stop changing size.
     reader_margin: Cell<i32>,
@@ -231,6 +235,8 @@ impl Editor {
             previewing: RefCell::new(None),
             preview_due: RefCell::new(None),
             preview: RefCell::new(None),
+            copy_due: RefCell::new(None),
+            copied: RefCell::new(None),
             reader_margin: Cell::new(render::MARGIN),
             refit_due: RefCell::new(None),
             fit_queued: Cell::new(false),
@@ -402,17 +408,36 @@ impl Editor {
         // double-click to edit.
         let click = gtk::GestureClick::new();
         click.set_button(gdk::BUTTON_PRIMARY);
+        // A click that clears a selection does only that (the press clears it).
+        let selected = Rc::new(Cell::new(false));
+        let weak = Rc::downgrade(self);
+        let selected_in = selected.clone();
+        click.connect_pressed(move |_, _, _, _| {
+            if let Some(editor) = weak.upgrade() {
+                selected_in.set(editor.reader.buffer().has_selection());
+            }
+        });
         let weak = Rc::downgrade(self);
         click.connect_released(move |gesture, presses, x, y| {
             let Some(editor) = weak.upgrade() else { return };
             editor.hover(None, 0.0, 0.0);
             if presses == 2 {
+                // Its first click didn't copy anything after all.
+                if let Some(due) = editor.copy_due.take() {
+                    due.remove();
+                }
                 editor.set_reading(false);
-            } else if !editor.reader.buffer().has_selection()
+            } else if !selected.get()
+                && !editor.reader.buffer().has_selection()
                 && let Some(target) = editor.target_at(x, y)
             {
-                let new_tab = gesture.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
-                editor.follow(target, new_tab);
+                match target {
+                    Target::Copy(code) => editor.copy_soon(code),
+                    target => {
+                        let new_tab = gesture.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
+                        editor.follow(target, new_tab);
+                    }
+                }
             }
         });
         self.reader.add_controller(click);
@@ -424,7 +449,9 @@ impl Editor {
                 let target = editor.target_at(x, y);
                 editor.reader.set_cursor_from_name(target.as_ref().map(|_| "pointer"));
                 let copies = matches!(target, Some(Target::Copy(_)));
-                editor.reader.set_tooltip_text(copies.then_some("Click to copy"));
+                if copies != editor.reader.tooltip_text().is_some() {
+                    editor.reader.set_tooltip_text(copies.then_some("Click to copy"));
+                }
                 editor.hover(target, x, y);
             }
         });
@@ -1169,19 +1196,53 @@ impl Editor {
         targets.iter().find(|(tag, _)| iter.has_tag(tag)).map(|(_, target)| target.clone())
     }
 
-    /// "Copied", over the bottom of the tab for a moment.
+    /// Copies `code` once the click on it can't be the first of a double-click, which edits.
+    fn copy_soon(&self, code: Rc<str>) {
+        if let Some(due) = self.copy_due.take() {
+            due.remove();
+        }
+        let wait = gtk::Settings::default().map_or(400, |settings| settings.gtk_double_click_time());
+        let me = self.me.clone();
+        let due = glib::timeout_add_local_once(Duration::from_millis(wait.max(0) as u64), move || {
+            if let Some(editor) = me.upgrade() {
+                editor.copy_due.take();
+                editor.reader.clipboard().set_text(&code);
+                editor.show_copied();
+            }
+        });
+        *self.copy_due.borrow_mut() = Some(due);
+    }
+
+    /// "Copied", over the bottom of the tab for a moment (and said, to a screen reader).
     fn show_copied(&self) {
-        let label = gtk::Label::builder()
-            .label("Copied")
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::End)
-            .margin_bottom(24)
-            .can_target(false)
-            .css_classes(["nevis-toast"])
-            .build();
-        self.layer.add_overlay(&label);
-        let layer = self.layer.clone();
-        glib::timeout_add_local_once(Duration::from_millis(1200), move || layer.remove_overlay(&label));
+        let label = match self.copied.take() {
+            Some((label, going)) => {
+                going.remove();
+                label
+            }
+            None => {
+                let label = gtk::Label::builder()
+                    .label("Copied")
+                    .halign(gtk::Align::Center)
+                    .valign(gtk::Align::End)
+                    .margin_bottom(24)
+                    .can_target(false)
+                    .css_classes(["nevis-toast"])
+                    .build();
+                self.layer.add_overlay(&label);
+                label
+            }
+        };
+        self.reader.announce("Copied", gtk::AccessibleAnnouncementPriority::Medium);
+        let me = self.me.clone();
+        let shown = label.clone();
+        let going = glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+            if let Some(editor) = me.upgrade() {
+                editor.copied.take();
+                editor.layer.remove_overlay(&shown);
+            }
+        });
+        *self.copied.borrow_mut() = Some((label, going));
     }
 
     fn follow(self: &Rc<Self>, target: Target, new_tab: bool) {
