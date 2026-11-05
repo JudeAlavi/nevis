@@ -2602,6 +2602,8 @@ impl Editor {
             column: cursor.line_offset() as u32,
             reading: self.is_reading(),
             side_by_side: self.is_split(),
+            // The window knows which pane.
+            right_pane: false,
         }
     }
 

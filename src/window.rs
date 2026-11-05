@@ -46,18 +46,74 @@ pub enum How {
     Replace,
 }
 
+/// One side of the window: its own tab bar (shown with two tabs or more, or in split view),
+/// scrolled sideways when it overflows, over its tab in front.
+struct Pane {
+    root: gtk::Box,
+    bar: gtk::Box,
+    scroller: gtk::ScrolledWindow,
+    pages: gtk::Stack,
+    /// The tab in front of this pane.
+    front: RefCell<Option<Rc<Editor>>>,
+}
+
+impl Pane {
+    fn new() -> (Self, gtk::Label) {
+        // Not a GtkNotebook: it squeezes tabs to an ellipsis even with room to spare, and its
+        // scroll arrows cost ~0.4 s of icon loading when they first show.
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        // After the tabs, "+" for a new one (a label: no icons).
+        let new_tab = gtk::Label::builder().label("+").css_classes(["nevis-tab-new"]).tooltip_text("New tab (Ctrl+T)").build();
+        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        strip.add_css_class("nevis-tabbar");
+        strip.append(&bar);
+        strip.append(&new_tab);
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::External)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .child(&strip)
+            .visible(false)
+            .build();
+        let pages = gtk::Stack::builder().vexpand(true).hexpand(true).hhomogeneous(false).vhomogeneous(false).build();
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.add_css_class("nevis-pane");
+        root.append(&scroller);
+        root.append(&pages);
+        (Self { root, bar, scroller, pages, front: RefCell::new(None) }, new_tab)
+    }
+}
+
+/// Where a tab being dragged would go if let go now.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Landing {
+    /// Along a pane's tab bar, at this x in the bar.
+    Bar(usize, f64),
+    /// Into a pane (split view).
+    Pane(usize),
+    /// Split view, the tab on this side (0 left, 1 right).
+    Split(usize),
+    /// Out of the window: a window of its own.
+    Out,
+}
+
 pub struct Window {
     pub window: gtk::ApplicationWindow,
     /// Holds `paned`, with the popups (cheat sheet, switcher…) drawn over it.
     overlay: gtk::Overlay,
     /// The folder sidebar (once shown) beside the tabs.
     paned: gtk::Paned,
-    /// The tab bar (shown with two tabs or more), scrolled sideways when it overflows, and
-    /// the pages under it.
-    bar: gtk::Box,
-    bar_scroller: gtk::ScrolledWindow,
-    pages: gtk::Stack,
-    /// The tabs in order, and the one in front.
+    /// The left pane and the right one (shown in split view, and only then), each with its
+    /// own tabs, side by side in `split`.
+    panes: [Pane; 2],
+    split: gtk::Paned,
+    /// The pane with the focus, which holds the tab in front.
+    active: Cell<usize>,
+    /// While a tab is dragged: where it would land, shown by this highlight.
+    drop_zone: gtk::DrawingArea,
+    /// The highlight's rectangle in the overlay (x, y, width, height), if one shows.
+    zone: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// The tabs (in no particular order: `tabs()` gives the order they show in), and the one
+    /// in front.
     editors: RefCell<Vec<Rc<Editor>>>,
     current: RefCell<Option<Rc<Editor>>>,
     /// The folder this window browses, if any, and its sidebar (created on first Ctrl+B).
@@ -88,33 +144,52 @@ pub struct Window {
 
 impl Window {
     fn new(app: &gtk::Application) -> Rc<Self> {
-        // Not a GtkNotebook: it squeezes tabs to an ellipsis even with room to spare, and its
-        // scroll arrows cost ~0.4 s of icon loading when they first show.
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        // After the tabs, "+" for a new one (a label: no icons).
-        let new_tab = gtk::Label::builder().label("+").css_classes(["nevis-tab-new"]).tooltip_text("New tab (Ctrl+T)").build();
-        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        strip.add_css_class("nevis-tabbar");
-        strip.append(&bar);
-        strip.append(&new_tab);
-        let bar_scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::External)
-            .vscrollbar_policy(gtk::PolicyType::Never)
-            .child(&strip)
-            .visible(false)
+        let (left, left_new) = Pane::new();
+        let (right, right_new) = Pane::new();
+        right.root.set_visible(false);
+        let split = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .start_child(&left.root)
+            .end_child(&right.root)
+            .resize_start_child(true)
+            .resize_end_child(true)
+            .shrink_start_child(false)
+            .shrink_end_child(false)
+            .hexpand(true)
+            .vexpand(true)
             .build();
-        let pages = gtk::Stack::builder().vexpand(true).hexpand(true).hhomogeneous(false).vhomogeneous(false).build();
-        let tabbed = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        tabbed.append(&bar_scroller);
-        tabbed.append(&pages);
         let paned = gtk::Paned::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .end_child(&tabbed)
+            .end_child(&split)
             .resize_start_child(false)
             .shrink_start_child(false)
             .position(240)
             .build();
         let overlay = gtk::Overlay::builder().child(&paned).build();
+        // Drawn rather than laid out: moving it must not make the window measure itself again
+        // on every move of the mouse (dragging lagged).
+        let drop_zone = gtk::DrawingArea::builder().css_classes(["nevis-drop-zone"]).can_target(false).visible(false).build();
+        let zone: Rc<Cell<Option<(f64, f64, f64, f64)>>> = Rc::default();
+        let shown = zone.clone();
+        drop_zone.set_draw_func(move |area, cairo, _, _| {
+            let Some((x, y, w, h)) = shown.get() else { return };
+            let color = area.color();
+            let (r, g, b) = (f64::from(color.red()), f64::from(color.green()), f64::from(color.blue()));
+            let radius = 10.0_f64.min(w / 2.0).min(h / 2.0);
+            let degrees = std::f64::consts::PI / 180.0;
+            cairo.new_sub_path();
+            cairo.arc(x + w - radius, y + radius, radius, -90.0 * degrees, 0.0);
+            cairo.arc(x + w - radius, y + h - radius, radius, 0.0, 90.0 * degrees);
+            cairo.arc(x + radius, y + h - radius, radius, 90.0 * degrees, 180.0 * degrees);
+            cairo.arc(x + radius, y + radius, radius, 180.0 * degrees, 270.0 * degrees);
+            cairo.close_path();
+            cairo.set_source_rgba(r, g, b, 0.16);
+            let _ = cairo.fill_preserve();
+            cairo.set_source_rgba(r, g, b, 0.75);
+            cairo.set_line_width(2.0);
+            let _ = cairo.stroke();
+        });
+        overlay.add_overlay(&drop_zone);
         let size = window_size::recall();
         let window = gtk::ApplicationWindow::builder()
             .application(app)
@@ -128,9 +203,11 @@ impl Window {
             window,
             overlay,
             paned,
-            bar,
-            bar_scroller,
-            pages,
+            panes: [left, right],
+            split,
+            active: Cell::new(0),
+            drop_zone,
+            zone,
             editors: RefCell::new(Vec::new()),
             current: RefCell::new(None),
             folder: RefCell::new(None),
@@ -150,14 +227,18 @@ impl Window {
             confirmed: Cell::new(false),
             restoring: Cell::new(false),
         });
-        let click = gtk::GestureClick::new();
-        let weak = Rc::downgrade(&this);
-        click.connect_released(move |_, _, _, _| {
-            if let Some(this) = weak.upgrade() {
-                this.new_tab();
-            }
-        });
-        new_tab.add_controller(click);
+        // Each pane's "+": a new tab there.
+        for (index, label) in [left_new, right_new].into_iter().enumerate() {
+            let click = gtk::GestureClick::new();
+            let weak = Rc::downgrade(&this);
+            click.connect_released(move |_, _, _, _| {
+                if let Some(this) = weak.upgrade() {
+                    this.active.set(index);
+                    this.new_tab();
+                }
+            });
+            label.add_controller(click);
+        }
         this.install_actions();
         this.connect_signals();
         WINDOWS.with_borrow_mut(|windows| windows.push(this.clone()));
@@ -175,18 +256,47 @@ impl Window {
         self.current.borrow().clone()
     }
 
-    /// The tabs, in the order they show.
+    /// The tabs of pane `pane`, in the order they show.
+    fn pane_tabs(&self, pane: usize) -> Vec<Rc<Editor>> {
+        let editors = self.editors.borrow();
+        let mut tabs = Vec::with_capacity(editors.len());
+        let mut child = self.panes[pane].bar.first_child();
+        while let Some(widget) = child {
+            if let Some(editor) = editors.iter().find(|editor| editor.tab == widget) {
+                tabs.push(editor.clone());
+            }
+            child = widget.next_sibling();
+        }
+        tabs
+    }
+
+    /// The tabs, in the order they show: the left pane's, then the right one's.
     fn tabs(&self) -> Vec<Rc<Editor>> {
-        self.editors.borrow().clone()
+        let mut tabs = self.pane_tabs(0);
+        tabs.extend(self.pane_tabs(1));
+        tabs
     }
 
     fn index_of(&self, editor: &Editor) -> Option<usize> {
-        self.editors.borrow().iter().position(|other| std::ptr::eq(other.as_ref(), editor))
+        self.tabs().iter().position(|other| std::ptr::eq(other.as_ref(), editor))
+    }
+
+    /// The pane holding `editor`'s tab.
+    fn pane_of(&self, editor: &Editor) -> usize {
+        let in_right = editor.tab.parent().is_some_and(|parent| parent == *self.panes[1].bar.upcast_ref::<gtk::Widget>());
+        usize::from(in_right)
+    }
+
+    /// Two panes side by side?
+    fn is_split(&self) -> bool {
+        // Its own setting: before the window shows, nothing counts as visible.
+        self.panes[1].root.get_visible()
     }
 
     fn add_tab(self: &Rc<Self>, editor: Rc<Editor>, select: bool) -> Rc<Editor> {
         self.editors.borrow_mut().push(editor.clone());
-        self.bar.append(&editor.tab);
+        let pane = if self.is_split() { self.active.get() } else { 0 };
+        self.panes[pane].bar.append(&editor.tab);
         // The page joins the window when the tab is first shown: unseen tabs cost little.
         // A click on the tab brings it to the front (its close button takes its own clicks).
         let click = gtk::GestureClick::new();
@@ -197,28 +307,40 @@ impl Window {
             }
         });
         editor.tab.add_controller(click);
+        // A right-click: the tab's menu (split view, a window of its own).
+        let menu = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+        let (this, tab) = (Rc::downgrade(self), Rc::downgrade(&editor));
+        menu.connect_pressed(move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            if let (Some(this), Some(tab)) = (this.upgrade(), tab.upgrade()) {
+                this.tab_menu(&tab);
+            }
+        });
+        editor.tab.add_controller(menu);
         // While restoring, the window picks its front tab itself.
         if select || (self.current.borrow().is_none() && !self.restoring.get()) {
             self.select(&editor);
+        } else if self.panes[pane].front.borrow().is_none() && !self.restoring.get() {
+            self.bring_forward(pane, &editor);
         }
         self.tabs_changed();
         editor
     }
 
-    /// Brings `editor`'s tab to the front.
+    /// Brings `editor`'s tab to the front, in its pane, which takes the focus.
     fn select(&self, editor: &Rc<Editor>) {
-        let previous = self.current.replace(Some(editor.clone()));
-        if let Some(previous) = previous.filter(|p| !Rc::ptr_eq(p, editor)) {
-            previous.tab.remove_css_class("current");
+        let pane = self.pane_of(editor);
+        let moved = self.active.replace(pane) != pane;
+        self.bring_forward(pane, editor);
+        if let Some(previous) = self.current.replace(Some(editor.clone())).filter(|p| !Rc::ptr_eq(p, editor)) {
+            previous.tab.remove_css_class("active");
         }
-        editor.tab.add_css_class("current");
-        if editor.page.parent().is_none() {
-            self.pages.add_child(&editor.page);
-        }
-        self.pages.set_visible_child(&editor.page);
+        editor.tab.add_css_class("active");
+        self.mark_active_pane();
         self.scroll_to_tab(editor);
-        if !self.restoring.get() {
-            editor.ensure_loaded();
+        // Over to the other pane: the keyboard goes along.
+        if moved && !self.restoring.get() && !self.pane_has_focus(pane) {
+            editor.focus_view();
         }
         self.reading_changed(editor, editor.is_reading());
         if editor.focus_mode() != self.focused.get() {
@@ -231,9 +353,239 @@ impl Window {
         store_soon();
     }
 
-    /// Scrolls the tab bar so that `editor`'s tab shows, once it is laid out.
+    /// Shows `editor` in front of its pane, leaving the focus where it is.
+    fn bring_forward(&self, pane: usize, editor: &Rc<Editor>) {
+        let side = &self.panes[pane];
+        if let Some(old) = side.front.replace(Some(editor.clone())).filter(|old| !Rc::ptr_eq(old, editor)) {
+            old.tab.remove_css_class("current");
+        }
+        editor.tab.add_css_class("current");
+        let page = &editor.page;
+        match page.parent() {
+            Some(parent) if parent == *side.pages.upcast_ref::<gtk::Widget>() => {}
+            Some(parent) => {
+                if let Some(old) = parent.downcast_ref::<gtk::Stack>() {
+                    old.remove(page);
+                }
+                side.pages.add_child(page);
+            }
+            None => {
+                side.pages.add_child(page);
+            }
+        }
+        side.pages.set_visible_child(page);
+        if !self.restoring.get() {
+            editor.ensure_loaded();
+        }
+    }
+
+    /// In split view, the pane without the focus shows so.
+    fn mark_active_pane(&self) {
+        for (index, pane) in self.panes.iter().enumerate() {
+            if self.is_split() && index != self.active.get() {
+                pane.root.add_css_class("inactive");
+            } else {
+                pane.root.remove_css_class("inactive");
+            }
+        }
+    }
+
+    /// Whether the keyboard focus is in pane `pane`.
+    fn pane_has_focus(&self, pane: usize) -> bool {
+        let pages = &self.panes[pane].pages;
+        gtk::prelude::GtkWindowExt::focus(&self.window).is_some_and(|focus| focus == *pages.upcast_ref::<gtk::Widget>() || focus.is_ancestor(pages))
+    }
+
+    /// Moves `editor`'s tab to pane `pane`, before the tab at place `at` along its bar (at
+    /// the end, for none), and brings it to the front there. A pane left without tabs closes.
+    fn move_to_pane(&self, editor: &Rc<Editor>, pane: usize, at: Option<usize>) {
+        let from = self.pane_of(editor);
+        let mut targets = self.pane_tabs(pane);
+        targets.retain(|other| !Rc::ptr_eq(other, editor));
+        let after = match at {
+            Some(0) => None,
+            Some(n) => targets.get(n - 1).or(targets.last()).map(|e| e.tab.clone()),
+            None => targets.last().map(|e| e.tab.clone()),
+        };
+        if from != pane {
+            // What the pane it leaves shows next.
+            if self.panes[from].front.borrow().as_ref().is_some_and(|front| Rc::ptr_eq(front, editor)) {
+                self.panes[from].front.replace(None);
+                editor.tab.remove_css_class("current");
+                let all = self.pane_tabs(from);
+                let index = all.iter().position(|other| Rc::ptr_eq(other, editor)).unwrap_or(0);
+                let rest: Vec<_> = all.into_iter().filter(|other| !Rc::ptr_eq(other, editor)).collect();
+                let next = rest.get(index.saturating_sub(1)).cloned();
+                if let Some(next) = next {
+                    self.bring_forward(from, &next);
+                }
+            }
+            self.panes[from].bar.remove(&editor.tab);
+            self.panes[pane].bar.append(&editor.tab);
+            if pane == 1 && !self.is_split() {
+                self.open_right_pane();
+            }
+            // Re-measured in its new bar (its title would stay cut to its old width).
+            let tab = editor.tab.clone();
+            glib::idle_add_local_once(move || {
+                let mut child = tab.first_child();
+                while let Some(widget) = child {
+                    widget.queue_resize();
+                    child = widget.next_sibling();
+                }
+            });
+        }
+        self.panes[pane].bar.reorder_child_after(&editor.tab, after.as_ref());
+        self.select(editor);
+        self.collapse();
+        self.tabs_changed();
+    }
+
+    /// Shows the right pane, half the width.
+    fn open_right_pane(&self) {
+        self.panes[1].root.set_visible(true);
+        // Half and half once laid out (on restoring, the window isn't yet: try again a while).
+        let split = self.split.clone();
+        let tries = Cell::new(0);
+        glib::timeout_add_local(Duration::from_millis(30), move || {
+            let width = split.width();
+            if width > 0 {
+                split.set_position(width / 2);
+                return glib::ControlFlow::Break;
+            }
+            tries.set(tries.get() + 1);
+            if tries.get() > 100 { glib::ControlFlow::Break } else { glib::ControlFlow::Continue }
+        });
+    }
+
+    /// A pane left without tabs closes; the other then fills the window.
+    fn collapse(&self) {
+        if !self.is_split() {
+            return;
+        }
+        let (left, right) = (self.pane_tabs(0), self.pane_tabs(1));
+        if !right.is_empty() && !left.is_empty() {
+            return;
+        }
+        if left.is_empty() {
+            // The right pane's tabs become the only ones.
+            let front = self.panes[1].front.take();
+            for editor in &right {
+                self.panes[1].bar.remove(&editor.tab);
+                self.panes[0].bar.append(&editor.tab);
+            }
+            if let Some(front) = front {
+                self.panes[0].front.replace(None);
+                self.bring_forward(0, &front);
+            }
+        }
+        self.panes[1].front.replace(None);
+        self.panes[1].root.set_visible(false);
+        self.active.set(0);
+        self.mark_active_pane();
+    }
+
+    /// Ctrl+\: split view, the tab in front moving to a pane of its own on the right (with a
+    /// single tab, a new note there); in split view, back to one pane with all the tabs.
+    fn toggle_split(self: &Rc<Self>) {
+        let Some(current) = self.current() else { return };
+        if self.is_split() {
+            let right = self.pane_tabs(1);
+            self.panes[1].front.replace(None);
+            for editor in &right {
+                editor.tab.remove_css_class("current");
+                self.panes[1].bar.remove(&editor.tab);
+                self.panes[0].bar.append(&editor.tab);
+            }
+            self.panes[1].root.set_visible(false);
+            self.select(&current);
+            if let Some(front) = self.panes[0].front.borrow().clone() {
+                front.tab.add_css_class("current");
+            }
+            self.mark_active_pane();
+            self.tabs_changed();
+            current.focus_view();
+            return;
+        }
+        if self.pane_tabs(0).len() < 2 {
+            self.open_right_pane();
+            self.active.set(1);
+            self.new_tab();
+            return;
+        }
+        self.move_to_pane(&current, 1, None);
+        current.focus_view();
+    }
+
+    /// "Move to Other Side": `editor` into the other pane, or a new one on the right.
+    fn to_other_side(self: &Rc<Self>, editor: &Rc<Editor>) {
+        let pane = if self.is_split() { 1 - self.pane_of(editor) } else { 1 };
+        self.move_to_pane(editor, pane, None);
+        editor.focus_view();
+    }
+
+    /// A tab into a window of its own, as a browser's tab dragged off its bar. Unsaved text
+    /// goes along (as a draft).
+    fn move_to_new_window(self: &Rc<Self>, editor: &Rc<Editor>) {
+        if self.tabs().len() < 2 {
+            return;
+        }
+        if editor.is_modified() && !crate::session::enabled() {
+            return alert(&self.window, "Save the note first", "Its unsaved changes can only move to a new window once saved.");
+        }
+        let Some(app) = self.window.application() else { return };
+        editor.keep_draft_now();
+        let state = editor.tab_state();
+        self.detach(editor);
+        let window = Window::new(&app);
+        window.add_tab(Editor::restored(&window, state), true);
+        if let Some(moved) = window.current() {
+            moved.ensure_loaded();
+            moved.focus_view();
+        }
+        window.window.present();
+        store_soon();
+    }
+
+    /// The menu for a tab: split view, a window of its own, closing.
+    fn tab_menu(self: &Rc<Self>, editor: &Rc<Editor>) {
+        let Some(index) = self.index_of(editor) else { return };
+        let item = |label: &str, action: &str| {
+            let item = gio::MenuItem::new(Some(label), None);
+            item.set_action_and_target_value(Some(action), Some(&index.to_string().to_variant()));
+            item
+        };
+        let menu = gio::Menu::new();
+        let views = gio::Menu::new();
+        if self.is_split() {
+            let label = if self.pane_of(editor) == 0 { "Move to Right Side" } else { "Move to Left Side" };
+            views.append_item(&item(label, "win.tab-beside"));
+            views.append(Some("Close Split View"), Some("win.split-view"));
+        } else if self.tabs().len() > 1 {
+            views.append_item(&item("Split Right", "win.tab-beside"));
+        }
+        if self.tabs().len() > 1 {
+            views.append_item(&item("Move to New Window", "win.tab-to-window"));
+        }
+        menu.append_section(None, &views);
+        let closing = gio::Menu::new();
+        closing.append_item(&item("Close Tab", "win.tab-close"));
+        menu.append_section(None, &closing);
+
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(&editor.tab);
+        popover.set_has_arrow(false);
+        popover.set_halign(gtk::Align::Start);
+        popover.connect_closed(|popover| {
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        popover.popup();
+    }
+
+    /// Scrolls its pane's tab bar so that `editor`'s tab shows, once it is laid out.
     fn scroll_to_tab(&self, editor: &Rc<Editor>) {
-        let (scroller, tab) = (self.bar_scroller.clone(), editor.tab.clone());
+        let (scroller, tab) = (self.panes[self.pane_of(editor)].scroller.clone(), editor.tab.clone());
         glib::idle_add_local_once(move || {
             let Some(bounds) = tab.compute_bounds(&scroller) else { return };
             let adjustment = scroller.hadjustment();
@@ -247,9 +599,13 @@ impl Window {
     }
 
     fn tabs_changed(&self) {
-        let editors = self.editors.borrow();
-        // A single tab needs no tab bar, unless the settings say otherwise.
-        self.bar_scroller.set_visible(!self.focused.get() && (editors.len() > 1 || settings::get().tab_bar_always));
+        let editors = self.tabs();
+        // A single tab needs no tab bar, unless the settings say otherwise; in split view
+        // each pane shows its own.
+        let split = self.is_split();
+        let shown = !self.focused.get() && (split || editors.len() > 1 || settings::get().tab_bar_always);
+        self.panes[0].scroller.set_visible(shown);
+        self.panes[1].scroller.set_visible(shown && split);
         // Alt+1…8 pick the first eight tabs and Alt+9 the last, so those are the numbers shown.
         for (index, editor) in editors.iter().enumerate() {
             let number = if index < 8 {
@@ -259,45 +615,156 @@ impl Window {
             };
             editor.set_number(number);
         }
-        drop(editors);
+        self.mark_active_pane();
         self.update_title();
         store_soon();
     }
 
-    /// Moves the tab in front `by` places along the bar.
+    /// Moves the tab in front `by` places along its pane's bar.
     fn move_tab(&self, by: i32) {
         let Some(editor) = self.current() else { return };
-        let Some(index) = self.index_of(&editor) else { return };
+        let pane = self.pane_of(&editor);
+        let Some(index) = self.pane_tabs(pane).iter().position(|other| Rc::ptr_eq(other, &editor)) else { return };
         self.move_tab_to(&editor, (index as i32 + by).max(0) as usize);
         self.scroll_to_tab(&editor);
     }
 
-    /// Moves `editor`'s tab to place `target` along the bar (the last, if past it).
+    /// Moves `editor`'s tab to place `target` along its pane's bar (the last, if past it).
     fn move_tab_to(&self, editor: &Rc<Editor>, target: usize) {
-        let Some(index) = self.index_of(editor) else { return };
-        let target = target.min(self.editors.borrow().len() - 1);
+        let pane = self.pane_of(editor);
+        let mut tabs = self.pane_tabs(pane);
+        let Some(index) = tabs.iter().position(|other| Rc::ptr_eq(other, editor)) else { return };
+        let target = target.min(tabs.len() - 1);
         if target == index {
             return;
         }
-        let moved = self.editors.borrow_mut().remove(index);
-        self.editors.borrow_mut().insert(target, moved);
-        // The bar shows the tabs in the list's order.
-        let before = if target == 0 { None } else { Some(self.editors.borrow()[target - 1].tab.clone()) };
-        self.bar.reorder_child_after(&editor.tab, before.as_ref());
+        let moved = tabs.remove(index);
+        tabs.insert(target, moved);
+        let before = if target == 0 { None } else { Some(tabs[target - 1].tab.clone()) };
+        self.panes[pane].bar.reorder_child_after(&editor.tab, before.as_ref());
         self.tabs_changed();
     }
 
-    /// The tab at `x`, `y` in the bar.
-    fn tab_at(&self, x: f64, y: f64) -> Option<Rc<Editor>> {
+    /// The tab at `x`, `y` in pane `pane`'s bar.
+    fn tab_at(&self, pane: usize, x: f64, y: f64) -> Option<Rc<Editor>> {
         let point = gtk::graphene::Point::new(x as f32, y as f32);
-        self.tabs().into_iter().find(|editor| editor.tab.compute_bounds(&self.bar).is_some_and(|bounds| bounds.contains_point(&point)))
+        let bar = &self.panes[pane].bar;
+        self.pane_tabs(pane).into_iter().find(|editor| editor.tab.compute_bounds(bar).is_some_and(|bounds| bounds.contains_point(&point)))
     }
 
-    /// Where the middle of the tab at place `index` is, along the bar.
-    fn middle_of(&self, index: usize) -> Option<f64> {
-        let editor = self.editors.borrow().get(index)?.clone();
-        let bounds = editor.tab.compute_bounds(&self.bar)?;
+    /// Where the middle of the tab at place `index` along pane `pane`'s bar is.
+    fn middle_of(&self, pane: usize, index: usize) -> Option<f64> {
+        let editor = self.pane_tabs(pane).get(index)?.clone();
+        let bounds = editor.tab.compute_bounds(&self.panes[pane].bar)?;
         Some(f64::from(bounds.x() + bounds.width() / 2.0))
+    }
+
+    /// The place along pane `pane`'s bar that a tab dropped at `x` (in the bar) takes.
+    fn place_at(&self, pane: usize, x: f64) -> usize {
+        let count = self.pane_tabs(pane).len();
+        (0..count).find(|&index| self.middle_of(pane, index).is_some_and(|middle| x < middle)).unwrap_or(count)
+    }
+
+    /// The bounds of `widget` in the overlay, as (x, y, width, height).
+    fn bounds_of(&self, widget: &impl IsA<gtk::Widget>) -> Option<(f64, f64, f64, f64)> {
+        let bounds = widget.compute_bounds(&self.overlay)?;
+        Some((f64::from(bounds.x()), f64::from(bounds.y()), f64::from(bounds.width()), f64::from(bounds.height())))
+    }
+
+    /// Where `editor`'s tab, dragged to `x`, `y` in the overlay, would land.
+    fn drop_at(&self, editor: &Rc<Editor>, x: f64, y: f64) -> Option<Landing> {
+        let (width, height) = (f64::from(self.overlay.width()), f64::from(self.overlay.height()));
+        if x < 0.0 || y < 0.0 || x > width || y > height {
+            return (self.tabs().len() > 1).then_some(Landing::Out);
+        }
+        let inside = |b: (f64, f64, f64, f64)| x >= b.0 && x <= b.0 + b.2 && y >= b.1 && y <= b.1 + b.3;
+        // On a tab bar (or just under it).
+        for (index, pane) in self.panes.iter().enumerate() {
+            if !pane.root.is_visible() {
+                continue;
+            }
+            if let Some((bx, by, bw, bh)) = self.bounds_of(&pane.scroller).filter(|_| pane.scroller.is_visible())
+                && inside((bx, by - 8.0, bw, bh + 16.0))
+            {
+                let point = pane.bar.compute_point(&self.overlay, &gtk::graphene::Point::new(0.0, 0.0));
+                let origin = point.map_or(bx, |p| f64::from(p.x()));
+                return Some(Landing::Bar(index, x - origin));
+            }
+        }
+        let from = self.pane_of(editor);
+        if self.is_split() {
+            for (index, pane) in self.panes.iter().enumerate() {
+                if let Some(bounds) = self.bounds_of(&pane.pages)
+                    && inside(bounds)
+                {
+                    return (index != from).then_some(Landing::Pane(index));
+                }
+            }
+            return None;
+        }
+        // One pane: its left or right half, for split view (with another tab to show beside).
+        let (px, py, pw, ph) = self.bounds_of(&self.panes[0].pages)?;
+        if !inside((px, py, pw, ph)) || self.pane_tabs(0).len() < 2 {
+            return None;
+        }
+        Some(Landing::Split(usize::from(x > px + pw / 2.0)))
+    }
+
+    /// Shows where a dragged tab would land (nothing for `None`, a tab bar or out).
+    fn show_drop(&self, drop: Option<Landing>) {
+        let zone = match drop {
+            Some(Landing::Pane(index)) => self.bounds_of(&self.panes[index].pages),
+            Some(Landing::Split(side)) => self.bounds_of(&self.panes[0].pages).map(|(x, y, w, h)| {
+                let half = (w / 2.0).floor();
+                if side == 0 { (x, y, half, h) } else { (x + w - half, y, half, h) }
+            }),
+            _ => None,
+        };
+        let zone = zone.map(|(x, y, w, h)| {
+            let inset = 6.0;
+            (x + inset, y + inset, (w - 2.0 * inset).max(1.0), (h - 2.0 * inset).max(1.0))
+        });
+        // Redrawn only when it changes.
+        if self.zone.get() == zone {
+            return;
+        }
+        self.zone.set(zone);
+        self.drop_zone.set_visible(zone.is_some());
+        self.drop_zone.queue_draw();
+    }
+
+    /// Where `editor`'s tab, dragged from pane `pane`'s bar by `dx`, `dy`, would land (None:
+    /// the position isn't known).
+    fn landing_of(&self, pane: usize, editor: &Rc<Editor>, gesture: &gtk::GestureDrag, dx: f64, dy: f64) -> Option<Option<Landing>> {
+        let (x, y) = gesture.start_point()?;
+        let point = gtk::graphene::Point::new((x + dx) as f32, (y + dy) as f32);
+        let point = self.panes[pane].bar.compute_point(&self.overlay, &point)?;
+        Some(self.drop_at(editor, f64::from(point.x()), f64::from(point.y())))
+    }
+
+    /// A dragged tab let go.
+    fn drop_tab(self: &Rc<Self>, editor: &Rc<Editor>, drop: Landing) {
+        match drop {
+            Landing::Bar(pane, x) => {
+                if pane != self.pane_of(editor) {
+                    let at = self.place_at(pane, x);
+                    self.move_to_pane(editor, pane, Some(at));
+                }
+            }
+            Landing::Pane(pane) => self.move_to_pane(editor, pane, None),
+            Landing::Split(1) => self.move_to_pane(editor, 1, None),
+            Landing::Split(_) => {
+                // On the left: every other tab goes right.
+                for other in self.pane_tabs(0).iter().filter(|other| !Rc::ptr_eq(other, editor)) {
+                    self.move_to_pane(other, 1, None);
+                }
+                self.select(editor);
+            }
+            Landing::Out => self.move_to_new_window(editor),
+        }
+        if !matches!(drop, Landing::Out) {
+            editor.focus_view();
+        }
     }
 
     /// A new, empty note in a tab of its own.
@@ -346,24 +813,42 @@ impl Window {
         if let Some(location) = editor.location() {
             self.closed.borrow_mut().push(location);
         }
-        let index = self.index_of(&editor);
-        self.editors.borrow_mut().retain(|other| !Rc::ptr_eq(other, &editor));
-        self.bar.remove(&editor.tab);
-        if editor.page.parent().is_some() {
-            self.pages.remove(&editor.page);
+        self.detach(&editor);
+    }
+
+    /// Takes a tab out of this window (closed, or moved to another); the window goes with
+    /// its last tab. A pane left without tabs closes.
+    fn detach(&self, editor: &Rc<Editor>) {
+        let pane = self.pane_of(editor);
+        let siblings = self.pane_tabs(pane);
+        let index = siblings.iter().position(|other| Rc::ptr_eq(other, editor)).unwrap_or(0);
+        self.editors.borrow_mut().retain(|other| !Rc::ptr_eq(other, editor));
+        self.panes[pane].bar.remove(&editor.tab);
+        if let Some(parent) = editor.page.parent().and_downcast::<gtk::Stack>() {
+            parent.remove(&editor.page);
         }
-        let next = index.and_then(|i| {
-            let editors = self.editors.borrow();
-            editors.get(i).or_else(|| editors.last()).cloned()
-        });
-        match next {
-            None => {
-                self.current.replace(None);
-                self.window.close();
-                return;
+        editor.tab.remove_css_class("current");
+        editor.tab.remove_css_class("active");
+        let was_front = self.panes[pane].front.borrow().as_ref().is_some_and(|front| Rc::ptr_eq(front, editor));
+        if was_front {
+            self.panes[pane].front.replace(None);
+            let rest = self.pane_tabs(pane);
+            if let Some(next) = rest.get(index).or_else(|| rest.last()).cloned() {
+                self.bring_forward(pane, &next);
             }
-            Some(next) if self.current.borrow().as_ref().is_some_and(|c| Rc::ptr_eq(c, &editor)) => self.select(&next),
-            Some(_) => {}
+        }
+        if self.editors.borrow().is_empty() {
+            self.current.replace(None);
+            self.window.close();
+            return;
+        }
+        self.collapse();
+        if self.current.borrow().as_ref().is_some_and(|current| Rc::ptr_eq(current, editor)) {
+            let front = self.panes[self.active.get()].front.borrow().clone().or_else(|| self.panes[0].front.borrow().clone());
+            let next = front.or_else(|| self.tabs().first().cloned());
+            if let Some(next) = next {
+                self.select(&next);
+            }
         }
         self.tabs_changed();
     }
@@ -496,6 +981,30 @@ impl Window {
                 w.open(file, None, How::NewTab);
             }
         });
+        self.action("split-view", |w| w.toggle_split());
+        // On the tab at a place along the bar (the tab menu's).
+        self.on_tab("tab-beside", |w, e| w.to_other_side(&e));
+        self.on_tab("tab-to-window", |w, e| w.move_to_new_window(&e));
+        self.on_tab("tab-close", |w, e| spawn(w.clone().close_tab(e)));
+        self.on_current("move-to-window", |w, e| w.move_to_new_window(&e));
+        // A tab dragged without a mouse, for trying it: NEVIS_ACTIONS="win.drag-tab:0 0.75 0.5
+        // drop" (the tab's place, where as a share of the window's width and height, then
+        // "drop" to let go there or "hover" to show where it would land).
+        self.with_text("drag-tab", |w, text| {
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            let [index, x, y, how] = parts[..] else { return };
+            let (Ok(index), Ok(x), Ok(y)) = (index.parse::<usize>(), x.parse::<f64>(), y.parse::<f64>()) else { return };
+            let Some(editor) = w.tabs().get(index).cloned() else { return };
+            let (width, height) = (f64::from(w.overlay.width()), f64::from(w.overlay.height()));
+            let landing = w.drop_at(&editor, x * width, y * height);
+            if how == "drop" {
+                if let Some(landing) = landing {
+                    w.drop_tab(&editor, landing);
+                }
+            } else {
+                w.show_drop(landing);
+            }
+        });
         self.action("move-tab-left", |w| w.move_tab(-1));
         self.action("move-tab-right", |w| w.move_tab(1));
         self.action("next-tab", |w| w.step_tab(1));
@@ -575,6 +1084,17 @@ impl Window {
         });
     }
 
+    /// An action on the tab at a place along the bar.
+    fn on_tab(self: &Rc<Self>, name: &str, run: impl Fn(&Rc<Self>, Rc<Editor>) + 'static) {
+        // The place as text, as other actions take their argument (and NEVIS_ACTIONS can).
+        self.with_text(name, move |this, index| {
+            let editor = index.parse::<usize>().ok().and_then(|index| this.tabs().get(index).cloned());
+            if let Some(editor) = editor {
+                run(this, editor);
+            }
+        });
+    }
+
     /// An action taking a string (a URL, a path).
     fn with_text(self: &Rc<Self>, name: &str, run: impl Fn(&Rc<Self>, String) + 'static) {
         let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
@@ -615,45 +1135,84 @@ impl Window {
     }
 
     fn connect_signals(self: &Rc<Self>) {
-        // A tab dragged along the bar takes the place of each one whose middle it passes (and
-        // can't flip back and forth over a wide one). The × takes its own clicks.
-        let drag = gtk::GestureDrag::new();
-        let dragged: Rc<RefCell<Option<Rc<Editor>>>> = Rc::default();
-        let (weak, held) = (Rc::downgrade(self), dragged.clone());
-        drag.connect_drag_begin(move |_, x, y| {
-            *held.borrow_mut() = weak.upgrade().and_then(|this| this.tab_at(x, y));
-        });
-        let (weak, held) = (Rc::downgrade(self), dragged.clone());
-        drag.connect_drag_update(move |gesture, dx, _| {
-            let (Some(this), Some(editor)) = (weak.upgrade(), held.borrow().clone()) else { return };
-            let threshold = gtk::Settings::default().map_or(8, |settings| settings.gtk_dnd_drag_threshold());
-            let Some((start, _)) = gesture.start_point() else { return };
-            if dx.abs() < f64::from(threshold) {
-                return;
-            }
-            let Some(index) = this.index_of(&editor) else { return };
-            let x = start + dx;
-            if this.middle_of(index + 1).is_some_and(|middle| x > middle) {
-                this.move_tab_to(&editor, index + 1);
-            } else if index > 0 && this.middle_of(index - 1).is_some_and(|middle| x < middle) {
-                this.move_tab_to(&editor, index - 1);
-            }
-        });
-        drag.connect_drag_end(move |_, _, _| {
-            dragged.borrow_mut().take();
-        });
-        self.bar.add_controller(drag);
-        // The mouse wheel scrolls an overflowing tab bar sideways.
-        let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-        let scroller = self.bar_scroller.downgrade();
-        wheel.connect_scroll(move |_, dx, dy| {
-            if let Some(scroller) = scroller.upgrade() {
-                let adjustment = scroller.hadjustment();
-                adjustment.set_value(adjustment.value() + (dx + dy) * 40.0);
-            }
-            glib::Propagation::Stop
-        });
-        self.bar_scroller.add_controller(wheel);
+        // A tab dragged along its bar takes the place of each one whose middle it passes (and
+        // can't flip back and forth over a wide one). Dragged over the window, a highlight
+        // shows where it would go: the other pane, or a half of this one (split view); off the
+        // window, it gets a window of its own. The × takes its own clicks.
+        for pane in 0..2 {
+            let drag = gtk::GestureDrag::new();
+            let dragged: Rc<RefCell<Option<Rc<Editor>>>> = Rc::default();
+            // Past the drag threshold once: a drag, not a click.
+            let moving: Rc<Cell<bool>> = Rc::default();
+            let (weak, held, started) = (Rc::downgrade(self), dragged.clone(), moving.clone());
+            drag.connect_drag_begin(move |_, x, y| {
+                started.set(false);
+                *held.borrow_mut() = weak.upgrade().and_then(|this| this.tab_at(pane, x, y));
+            });
+            let (weak, held, started) = (Rc::downgrade(self), dragged.clone(), moving.clone());
+            drag.connect_drag_update(move |gesture, dx, dy| {
+                let (Some(this), Some(editor)) = (weak.upgrade(), held.borrow().clone()) else { return };
+                let threshold = f64::from(gtk::Settings::default().map_or(8, |settings| settings.gtk_dnd_drag_threshold()));
+                if !started.get() && dx.abs() < threshold && dy.abs() < threshold {
+                    return;
+                }
+                started.set(true);
+                let Some(landing) = this.landing_of(pane, &editor, gesture, dx, dy) else { return };
+                // Along its own bar, it moves there and then.
+                if let Some(Landing::Bar(over, x)) = landing
+                    && over == pane
+                    && let Some(index) = this.pane_tabs(pane).iter().position(|other| Rc::ptr_eq(other, &editor))
+                {
+                    if this.middle_of(pane, index + 1).is_some_and(|middle| x > middle) {
+                        this.move_tab_to(&editor, index + 1);
+                    } else if index > 0 && this.middle_of(pane, index - 1).is_some_and(|middle| x < middle) {
+                        this.move_tab_to(&editor, index - 1);
+                    }
+                }
+                this.show_drop(landing);
+                editor.tab.set_opacity(if landing == Some(Landing::Out) { 0.4 } else { 1.0 });
+            });
+            let weak = Rc::downgrade(self);
+            drag.connect_drag_end(move |gesture, dx, dy| {
+                let held = dragged.borrow_mut().take();
+                let Some(this) = weak.upgrade() else { return };
+                this.show_drop(None);
+                let Some(editor) = held else { return };
+                editor.tab.set_opacity(1.0);
+                // Where it is let go, not where the last (perhaps late) move left it.
+                if moving.replace(false)
+                    && let Some(Some(landing)) = this.landing_of(pane, &editor, gesture, dx, dy)
+                {
+                    this.drop_tab(&editor, landing);
+                }
+            });
+            self.panes[pane].bar.add_controller(drag);
+            // The mouse wheel scrolls an overflowing tab bar sideways.
+            let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+            let scroller = self.panes[pane].scroller.downgrade();
+            wheel.connect_scroll(move |_, dx, dy| {
+                if let Some(scroller) = scroller.upgrade() {
+                    let adjustment = scroller.hadjustment();
+                    adjustment.set_value(adjustment.value() + (dx + dy) * 40.0);
+                }
+                glib::Propagation::Stop
+            });
+            self.panes[pane].scroller.add_controller(wheel);
+            // In split view, the pane clicked into (or tabbed into) holds the tab in front.
+            let focus = gtk::EventControllerFocus::new();
+            let weak = Rc::downgrade(self);
+            focus.connect_enter(move |_| {
+                let Some(this) = weak.upgrade() else { return };
+                if this.active.get() == pane || !this.is_split() {
+                    return;
+                }
+                let front = this.panes[pane].front.borrow().clone();
+                if let Some(front) = front {
+                    this.select(&front);
+                }
+            });
+            self.panes[pane].pages.add_controller(focus);
+        }
 
         let weak = Rc::downgrade(self);
         self.window.connect_close_request(move |_| {
@@ -1392,7 +1951,10 @@ impl Window {
         WindowState {
             folder: self.folder().and_then(|f| f.path()),
             active,
-            tabs: tabs.iter().map(|editor| editor.tab_state()).collect(),
+            tabs: tabs
+                .iter()
+                .map(|editor| session::TabState { right_pane: self.pane_of(editor) == 1, ..editor.tab_state() })
+                .collect(),
         }
     }
 }
@@ -1551,15 +2113,39 @@ fn restore(app: &gtk::Application, windows: Vec<WindowState>, load: bool) -> Opt
     if let Some(folder) = state.folder {
         window.show_folder(&gio::File::for_path(folder));
     }
+    // Split view comes back when both panes have tabs.
+    let split = tabs.iter().any(|tab| tab.right_pane) && tabs.iter().any(|tab| !tab.right_pane);
+    let mut restored = Vec::new();
     for tab in tabs {
-        window.add_tab(Editor::restored(&window, tab), false);
+        let right = split && tab.right_pane;
+        restored.push((window.add_tab(Editor::restored(&window, tab), false), right));
     }
-    if let Some(editor) = window.tabs().get(active).cloned() {
+    if split {
+        for (editor, _) in restored.iter().filter(|(_, right)| *right) {
+            window.panes[0].bar.remove(&editor.tab);
+            window.panes[1].bar.append(&editor.tab);
+        }
+        window.open_right_pane();
+    }
+    let ordered: Vec<Rc<Editor>> = restored.iter().map(|(editor, _)| editor.clone()).collect();
+    if let Some(editor) = ordered.get(active).cloned() {
+        // The other pane shows its first tab.
+        if split {
+            let other = 1 - window.pane_of(&editor);
+            if let Some(front) = window.pane_tabs(other).first() {
+                window.bring_forward(other, front);
+            }
+        }
         window.select(&editor);
     }
     window.restoring.set(false);
-    if load && let Some(editor) = window.current() {
-        editor.ensure_loaded();
+    window.tabs_changed();
+    if load {
+        for pane in &window.panes {
+            if let Some(editor) = pane.front.borrow().clone() {
+                editor.ensure_loaded();
+            }
+        }
     }
     window.window.present();
     Some(window)
@@ -1779,7 +2365,7 @@ fn build_menu() -> gio::Menu {
         ("Export as HTML…", "win.export-html"),
         ("Print…", "win.print"),
     ]));
-    menu.append_section(None, &section(&[("Find…", "win.find"), ("Reading View", "win.reading"), ("Side by Side", "win.side-by-side")]));
+    menu.append_section(None, &section(&[("Find…", "win.find"), ("Reading View", "win.reading"), ("Side by Side", "win.side-by-side"), ("Split View", "win.split-view")]));
     menu.append_section(None, &section(&[("Settings…", "win.settings"), ("Keyboard Shortcuts", "win.shortcuts")]));
     menu
 }

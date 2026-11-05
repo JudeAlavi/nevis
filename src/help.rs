@@ -39,8 +39,11 @@ const LEFT: &[(&str, &[Row])] = &[
     ]),
     ("Tabs", &[
         row("Next / previous tab", "win.next-tab", "Ctrl+Shift+Tab"),
-        row("Tab 1 … 8, last tab", "win.tab-1", "… Alt+9"),
+        row("Tab 1 … 8, last tab", "win.tab-1", "… Ctrl+9 / Alt+9"),
         row("Move tab left / right", "win.move-tab-left", "Ctrl+Shift+Page Down"),
+        row("Split view: two tabs side by side", "win.split-view", ""),
+        row("Move tab to a new window", "win.move-to-window", "or drag it out of the window"),
+        row("Split view by dragging", "", "Drag a tab to a side of the window"),
     ]),
     ("Find", &[
         row("Find", "win.find", ""),

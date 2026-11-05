@@ -29,6 +29,8 @@ pub struct TabState {
     pub reading: bool,
     /// Showing the source and the rendered view side by side.
     pub side_by_side: bool,
+    /// In the right pane of split view.
+    pub right_pane: bool,
 }
 
 impl Session {
@@ -59,7 +61,10 @@ impl Session {
                     if path.is_none() && draft.is_none() {
                         continue;
                     }
-                    let tab = TabState { path, draft, line, column, reading: view == "r", side_by_side: view == "s" };
+                    // A capital letter: in the right pane of split view.
+                    let right_pane = view.chars().all(|c| c.is_ascii_uppercase());
+                    let view = view.to_ascii_lowercase();
+                    let tab = TabState { path, draft, line, column, reading: view == "r", side_by_side: view == "s", right_pane };
                     if windows.is_empty() {
                         windows.push(WindowState { folder: None, active: 0, tabs: Vec::new() });
                     }
@@ -87,6 +92,7 @@ impl Session {
             text.push_str(&format!("window\t{}\t{folder}\n", window.active));
             for tab in &window.tabs {
                 let view = if tab.side_by_side { "s" } else if tab.reading { "r" } else { "e" };
+                let view = if tab.right_pane { view.to_ascii_uppercase() } else { view.to_owned() };
                 let draft = tab.draft.as_deref().unwrap_or("-");
                 let path = tab.path.as_ref().map(|p| p.to_string_lossy()).unwrap_or_default();
                 text.push_str(&format!("tab\t{view}\t{}\t{}\t{draft}\t{path}\n", tab.line, tab.column));
@@ -128,6 +134,8 @@ pub fn merged(windows: Vec<WindowState>) -> Option<WindowState> {
     let mut active = None;
     for (n, window) in windows.into_iter().enumerate() {
         for (i, tab) in window.tabs.into_iter().enumerate() {
+            // Split view only for the first window's tabs.
+            let tab = if n == 0 { tab } else { TabState { right_pane: false, ..tab } };
             let front = n == 0 && i == window.active;
             let twin = tab.path.as_ref().and_then(|path| tabs.iter().position(|t| t.path.as_ref() == Some(path)));
             let at = match twin {
@@ -207,7 +215,7 @@ mod tests {
     use super::*;
 
     fn tab(path: Option<&str>, draft: Option<&str>, line: u32, column: u32, reading: bool) -> TabState {
-        TabState { path: path.map(PathBuf::from), draft: draft.map(str::to_owned), line, column, reading, side_by_side: false }
+        TabState { path: path.map(PathBuf::from), draft: draft.map(str::to_owned), line, column, reading, side_by_side: false, right_pane: false }
     }
 
     #[test]

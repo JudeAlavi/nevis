@@ -549,6 +549,8 @@ fn chrome_css(c: &Colors) -> String {
          .nevis-tab:hover {{ color: {text}; background-color: alpha({text}, 0.05); }}
          .nevis-tab.current {{ color: {text}; background-color: {background}; box-shadow: 0 1px {background}, inset 0 1px alpha({border}, 0.5); }}
          .nevis-tab.current > .nevis-tab-title {{ font-weight: 500; }}
+         .nevis-pane.inactive .nevis-tab.current {{ color: {dim}; background-color: alpha({background}, 0.6); }}
+         .nevis-drop-zone {{ color: {accent}; }}
          .nevis-tab > .nevis-tab-number {{ margin-right: 6px; color: {accent}; font-weight: 600; }}
          .nevis-tab-close {{ min-width: 10px; padding: 0 6px; margin: 3px 0; color: transparent; border-radius: 999px;
              transition: color 120ms ease, background-color 120ms ease; }}
